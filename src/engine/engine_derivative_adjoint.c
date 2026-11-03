@@ -3337,8 +3337,8 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
   }
   mju_zero(dbar_qpos, m->nv);
   mj_markStack(d);
-  mjtNum* storage = mjSTACKALLOC(d, 33*m->nbody, mjtNum);
-  mju_zero(storage, 33*m->nbody);
+  mjtNum* storage = mjSTACKALLOC(d, 42*m->nbody, mjtNum);
+  mju_zero(storage, 42*m->nbody);
   mjtNum* angular_y = storage;
   mjtNum* linear_y = storage+3*m->nbody;
   mjtNum* angular_w = storage+6*m->nbody;
@@ -3350,6 +3350,19 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
   mjtNum* force_all = storage+24*m->nbody;
   mjtNum* moment_all = storage+27*m->nbody;
   mjtNum* delta_pos = storage+30*m->nbody;
+  mjtNum* com_all = storage+33*m->nbody;
+  mjtNum* inertia_all = storage+36*m->nbody;
+  mjtNum* axes_all = storage+39*m->nbody;
+  int use_masks = m->nbody <= 64;
+  uint64_t* ancestor_mask = NULL;
+  if (use_masks) {
+    ancestor_mask = mjSTACKALLOC(d, m->nbody, uint64_t);
+    ancestor_mask[0] = 1;
+    for (int body = 1; body < m->nbody; ++body) {
+      ancestor_mask[body] =
+          ancestor_mask[m->body_parentid[body]] | (UINT64_C(1) << body);
+    }
+  }
   for (int body = 1; body < m->nbody; ++body) {
     int parent = m->body_parentid[body];
     mjtNum offset[3];
@@ -3387,7 +3400,7 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
   }
 
   for (int body = 1; body < m->nbody; ++body) {
-    mjtNum com[3];
+    mjtNum* com = com_all+3*body;
     adj_mulMatVec3(com, d->xmat+9*body, m->body_ipos+3*body);
     mjtNum angular_com[3];
     adj_cross(angular_com, angular_y+3*body, com);
@@ -3395,8 +3408,12 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
     for (int k = 0; k < 3; ++k) {
       force_all[3*body+k] = mass*(linear_y[3*body+k] + angular_com[k]);
     }
-    mjtNum inertia[3];
+    mjtNum* inertia = inertia_all+3*body;
     body_inertia_mul(m, d, body, angular_y+3*body, inertia);
+    if (m->body_jntnum[body] && !(free_root && body == 1)) {
+      int joint = m->body_jntadr[body];
+      adj_mulMatVec3(axes_all+3*body, d->xmat+9*body, m->jnt_axis+3*joint);
+    }
     mjtNum com_force[3];
     adj_cross(com_force, com, force_all+3*body);
     adj_add3(moment_all+3*body, inertia, com_force);
@@ -3425,12 +3442,18 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
       // delta_pos is fully assigned below; clearing the four tangent arrays
       // is sufficient for each input column.
       mju_zero(delta_angular_all, 12*m->nbody);
-      for (int body = joint_body; body < m->nbody; ++body) {
-        int ancestor = body;
-        while (ancestor != joint_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
+      for (int body = 1; body < m->nbody; ++body) {
+        int descendant;
+        if (use_masks) {
+          descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
+        } else {
+          int ancestor = body;
+          while (ancestor != joint_body && ancestor > 0) {
+            ancestor = m->body_parentid[ancestor];
+          }
+          descendant = ancestor == joint_body;
         }
-        if (ancestor != joint_body) continue;
+        if (!descendant) continue;
         if (rotating) {
           mjtNum offset[3];
           adj_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
@@ -3439,19 +3462,23 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
           adj_copy3(delta_pos+3*body, axis);
         }
       }
-    for (int body = joint_body; body < m->nbody; ++body) {
-      int ancestor = body;
-      while (ancestor != joint_body && ancestor > 0) {
-        ancestor = m->body_parentid[ancestor];
+    for (int body = 1; body < m->nbody; ++body) {
+      int descendant;
+      if (use_masks) {
+        descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
+      } else {
+        int ancestor = body;
+        while (ancestor != joint_body && ancestor > 0) {
+          ancestor = m->body_parentid[ancestor];
+        }
+        descendant = ancestor == joint_body;
       }
-      if (ancestor != joint_body) continue;
-      mjtNum com[3];
-      adj_mulMatVec3(com, d->xmat+9*body, m->body_ipos+3*body);
+      if (!descendant) continue;
+      const mjtNum* com = com_all+3*body;
       mjtNum mass = m->body_mass[body];
       mjtNum* force = force_all+3*body;
       mjtNum* moment = moment_all+3*body;
-      mjtNum inertia[3];
-      body_inertia_mul(m, d, body, angular_y+3*body, inertia);
+      const mjtNum* inertia = inertia_all+3*body;
 
       mjtNum* delta_angular = delta_angular_all+3*body;
       mjtNum* delta_linear = delta_linear_all+3*body;
@@ -3463,9 +3490,7 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
       if (free_root && body == 1) body_joint = -1;
       mjtNum delta_axis[3] = {0, 0, 0};
       if (rotating && body_joint >= 0) {
-        mjtNum body_axis[3];
-        adj_mulMatVec3(body_axis, d->xmat+9*body, m->jnt_axis+3*body_joint);
-        adj_cross(delta_axis, axis, body_axis);
+        adj_cross(delta_axis, axis, axes_all+3*body);
       }
       mjtNum offset[3], delta_offset[3], tmp[3];
       adj_sub3(offset, d->xpos+3*body, d->xpos+3*parent);
