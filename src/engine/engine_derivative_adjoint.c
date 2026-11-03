@@ -1206,6 +1206,353 @@ static void body_inertia_mul(const mjModel* m, const mjData* d, int body,
   mju_mulMatVec3(result, rotation, local);
 }
 
+static int centered_zero_anchor_hinge_tree(const mjModel* m) {
+  for (int body = 1; body < m->nbody; ++body) {
+    if (m->body_rootid[body] != 1) return 0;
+    if (m->body_jntnum[body] > 1) return 0;
+    if (!m->body_jntnum[body]) return 0;
+    int joint = m->body_jntadr[body];
+    if (m->jnt_type[joint] != mjJNT_HINGE) return 0;
+    for (int k = 0; k < 3; ++k) {
+      if (m->jnt_pos[3*joint+k] != 0) return 0;
+    }
+  }
+  return 1;
+}
+
+static void adj_mulQuatVjp(mjtNum left_bar[4], mjtNum right_bar[4],
+                           const mjtNum left[4], const mjtNum right[4],
+                           const mjtNum cot[4]) {
+  const mjtNum* av = left+1;
+  const mjtNum* bv = right+1;
+  const mjtNum* cv = cot+1;
+  mjtNum bv_cv[3], cv_av[3];
+  adj_cross(bv_cv, bv, cv);
+  adj_cross(cv_av, cv, av);
+  left_bar[0] = right[0]*cot[0] + adj_dot3(bv, cv);
+  right_bar[0] = left[0]*cot[0] + adj_dot3(av, cv);
+  for (int k = 0; k < 3; ++k) {
+    left_bar[k+1] = right[0]*cv[k] - cot[0]*bv[k] + bv_cv[k];
+    right_bar[k+1] = left[0]*cv[k] - cot[0]*av[k] + cv_av[k];
+  }
+}
+
+static void adj_rotVecQuatVjp(mjtNum quat_bar[4], mjtNum vec_bar[3],
+                              const mjtNum quat[4], const mjtNum vec[3],
+                              const mjtNum cot[3]) {
+  const mjtNum* qv = quat+1;
+  mjtNum qv_x_vec[3], vec_x_cot[3], qv_x_cot[3], qv_vec_x_cot[3];
+  mjtNum qvcot_x_vec[3], cot_x_qv[3], cot_x_qv_x_qv[3];
+  adj_cross(qv_x_vec, qv, vec);
+  adj_cross(vec_x_cot, vec, cot);
+  adj_cross(qv_x_cot, qv, cot);
+  adj_cross(qv_vec_x_cot, qv_x_vec, cot);
+  adj_cross(qvcot_x_vec, qv_x_cot, vec);
+  adj_cross(cot_x_qv, cot, qv);
+  adj_cross(cot_x_qv_x_qv, cot_x_qv, qv);
+  quat_bar[0] = 2*adj_dot3(cot, qv_x_vec);
+  for (int k = 0; k < 3; ++k) {
+    quat_bar[k+1] = 2*quat[0]*vec_x_cot[k] + 2*qv_vec_x_cot[k] +
+                    2*qvcot_x_vec[k];
+    vec_bar[k] = cot[k] + 2*quat[0]*qv_x_cot[k] + 2*cot_x_qv_x_qv[k];
+  }
+}
+
+static void mulInertVecT(const mjtNum inertia[10], const mjtNum cot[6],
+                        mjtNum out[6]) {
+  // The 6D inertia Jacobian used by mju_mulInertVec is symmetric, so the
+  // transpose pullback has the same coefficients as the forward product.
+  out[0] = inertia[0]*cot[0] + inertia[3]*cot[1] + inertia[4]*cot[2] -
+           inertia[8]*cot[4] + inertia[7]*cot[5];
+  out[1] = inertia[3]*cot[0] + inertia[1]*cot[1] + inertia[5]*cot[2] +
+           inertia[8]*cot[3] - inertia[6]*cot[5];
+  out[2] = inertia[4]*cot[0] + inertia[5]*cot[1] + inertia[2]*cot[2] -
+           inertia[7]*cot[3] + inertia[6]*cot[4];
+  out[3] = inertia[8]*cot[1] - inertia[7]*cot[2] + inertia[9]*cot[3];
+  out[4] = inertia[6]*cot[2] - inertia[8]*cot[0] + inertia[9]*cot[4];
+  out[5] = inertia[7]*cot[0] - inertia[6]*cot[1] + inertia[9]*cot[5];
+}
+
+static int centered_zero_anchor_hinge_bias_pos_adjoint(
+    const mjModel* m, mjData* d, const mjtNum* bar_qfrc_bias,
+    mjtNum* dbar_qpos) {
+  int nbody = m->nbody;
+  int nv = m->nv;
+  if (!nbody) return mjADJ_OK;
+  mj_markStack(d);
+  mjtNum* storage = mjSTACKALLOC(d, 73*nbody + 12*nv, mjtNum);
+  mju_zero(storage, (size_t)(73*nbody + 12*nv));
+
+  mjtNum* cacc = storage;
+  mjtNum* force = storage + 6*nbody;
+  mjtNum* inertia_velocity = storage + 12*nbody;
+  mjtNum* bar_cdof = storage + 18*nbody;
+  mjtNum* bar_cdof_dot = storage + 18*nbody + 6*nv;
+  mjtNum* bar_cvel = storage + 18*nbody + 12*nv;
+  mjtNum* bar_cacc = bar_cvel + 6*nbody;
+  mjtNum* bar_force = bar_cacc + 6*nbody;
+  mjtNum* bar_rot_inertia = bar_force + 6*nbody;
+  mjtNum* bar_quat = bar_rot_inertia + 9*nbody;
+  mjtNum* bar_pos = bar_quat + 4*nbody;
+  mjtNum* bar_xipos = bar_pos + 3*nbody;
+
+  if (!mjDISABLED(mjDSBL_GRAVITY)) {
+    adj_scl3(cacc+3, m->opt.gravity, -1);
+  }
+
+  for (int body = 1; body < nbody; ++body) {
+    int parent = m->body_parentid[body];
+    int dof = m->body_dofadr[body];
+    for (int k = 0; k < 6; ++k) cacc[6*body+k] = cacc[6*parent+k];
+    if (dof >= 0) {
+      for (int k = 0; k < 6; ++k) {
+        cacc[6*body+k] += d->qvel[dof]*d->cdof_dot[6*dof+k];
+      }
+    }
+    mju_mulInertVec(inertia_velocity+6*body, d->cinert+10*body,
+                    d->cvel+6*body);
+    mju_crossForce(force+6*body, d->cvel+6*body, inertia_velocity+6*body);
+    mjtNum inertial_acceleration[6];
+    mju_mulInertVec(inertial_acceleration, d->cinert+10*body, cacc+6*body);
+    for (int k = 0; k < 6; ++k) force[6*body+k] += inertial_acceleration[k];
+  }
+
+  for (int dof = 0; dof < nv; ++dof) {
+    int body = m->dof_bodyid[dof];
+    mjtNum row_bar = bar_qfrc_bias[dof];
+    for (int k = 0; k < 6; ++k) {
+      bar_force[6*body+k] += row_bar*d->cdof[6*dof+k];
+      bar_cdof[6*dof+k] += row_bar*force[6*body+k];
+    }
+  }
+  for (int body = nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    if (!parent) continue;
+    for (int k = 0; k < 6; ++k) {
+      bar_force[6*body+k] += bar_force[6*parent+k];
+    }
+  }
+
+  for (int body = 1; body < nbody; ++body) {
+    const mjtNum* seed_force = bar_force+6*body;
+    const mjtNum* acceleration = cacc+6*body;
+    const mjtNum* velocity = d->cvel+6*body;
+    const mjtNum* iv = inertia_velocity+6*body;
+    mjtNum offset[3], inner_bar[6];
+    adj_sub3(offset, d->xipos+3*body,
+             d->subtree_com+3*m->body_rootid[body]);
+
+    const mjtNum* seed_ang = seed_force;
+    const mjtNum* seed_lin = seed_force+3;
+    const mjtNum* vel_ang = velocity;
+    const mjtNum* vel_lin = velocity+3;
+    const mjtNum* iv_ang = iv;
+    const mjtNum* iv_lin = iv+3;
+    mjtNum tmp[3], tmp1[3];
+
+    adj_cross(tmp, seed_ang, vel_ang);
+    inner_bar[0] = tmp[0]; inner_bar[1] = tmp[1]; inner_bar[2] = tmp[2];
+    adj_cross(tmp, seed_ang, vel_lin);
+    adj_cross(tmp1, seed_lin, vel_ang);
+    inner_bar[3] = tmp[0]+tmp1[0];
+    inner_bar[4] = tmp[1]+tmp1[1];
+    inner_bar[5] = tmp[2]+tmp1[2];
+
+    mjtNum direct_bar[6];
+    mulInertVecT(d->cinert+10*body, seed_force, direct_bar);
+    for (int k = 0; k < 6; ++k) bar_cacc[6*body+k] += direct_bar[k];
+
+    adj_cross(tmp, iv_ang, seed_ang);
+    adj_cross(tmp1, iv_lin, seed_lin);
+    for (int k = 0; k < 3; ++k) bar_cvel[6*body+k] += tmp[k]+tmp1[k];
+    adj_cross(tmp, iv_lin, seed_ang);
+    for (int k = 0; k < 3; ++k) bar_cvel[6*body+3+k] += tmp[k];
+    mjtNum inner_product_bar[6];
+    mulInertVecT(d->cinert+10*body, inner_bar, inner_product_bar);
+    for (int k = 0; k < 6; ++k) bar_cvel[6*body+k] += inner_product_bar[k];
+
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        bar_rot_inertia[9*body+3*row+col] +=
+            seed_ang[row]*acceleration[col] + inner_bar[row]*vel_ang[col];
+      }
+    }
+
+    mjtNum body_mass = m->body_mass[body];
+    for (int seed_kind = 0; seed_kind < 2; ++seed_kind) {
+      const mjtNum* cot = seed_kind == 0 ? seed_force : inner_bar;
+      const mjtNum* motion = seed_kind == 0 ? acceleration : velocity;
+      const mjtNum* cot_ang = cot;
+      const mjtNum* cot_lin = cot+3;
+      const mjtNum* motion_ang = motion;
+      const mjtNum* motion_lin = motion+3;
+      mjtNum common_a = adj_dot3(cot_ang, motion_ang);
+      mjtNum common_b = adj_dot3(offset, motion_ang);
+      mjtNum common_c = adj_dot3(cot_ang, offset);
+      adj_cross(tmp, motion_lin, cot_ang);
+      adj_cross(tmp1, cot_lin, motion_ang);
+      for (int k = 0; k < 3; ++k) {
+        mjtNum offset_bar = body_mass*
+            (2*common_a*offset[k] - common_b*cot_ang[k] -
+             common_c*motion_ang[k]);
+        offset_bar += body_mass*(tmp[k] + tmp1[k]);
+        bar_xipos[3*body+k] += offset_bar;
+      }
+    }
+  }
+
+  for (int body = nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    int dof = m->body_dofadr[body];
+    if (dof >= 0) {
+      for (int k = 0; k < 6; ++k) {
+        bar_cdof_dot[6*dof+k] += d->qvel[dof]*bar_cacc[6*body+k];
+      }
+    }
+    for (int k = 0; k < 6; ++k) {
+      bar_cacc[6*parent+k] += bar_cacc[6*body+k];
+    }
+  }
+
+  for (int body = nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    int dof = m->body_dofadr[body];
+    for (int k = 0; k < 6; ++k) {
+      bar_cvel[6*parent+k] += bar_cvel[6*body+k];
+    }
+    if (dof < 0) continue;
+    const mjtNum* cdof = d->cdof+6*dof;
+    const mjtNum* parent_velocity = d->cvel+6*parent;
+    const mjtNum* zbar_ang = bar_cdof_dot+6*dof;
+    const mjtNum* zbar_lin = bar_cdof_dot+6*dof+3;
+    const mjtNum* cdof_ang = cdof;
+    const mjtNum* cdof_lin = cdof+3;
+    const mjtNum* parent_ang = parent_velocity;
+    const mjtNum* parent_lin = parent_velocity+3;
+    mjtNum tmp[3], tmp1[3];
+
+    for (int k = 0; k < 6; ++k) {
+      bar_cdof[6*dof+k] += bar_cvel[6*body+k]*d->qvel[dof];
+    }
+    adj_cross(tmp, cdof_ang, zbar_ang);
+    adj_cross(tmp1, cdof_lin, zbar_lin);
+    for (int k = 0; k < 3; ++k) bar_cvel[6*parent+k] += tmp[k]+tmp1[k];
+    adj_cross(tmp, cdof_ang, zbar_lin);
+    for (int k = 0; k < 3; ++k) bar_cvel[6*parent+3+k] += tmp[k];
+    adj_cross(tmp, zbar_ang, parent_ang);
+    adj_cross(tmp1, zbar_lin, parent_lin);
+    for (int k = 0; k < 3; ++k) bar_cdof[6*dof+k] += tmp[k]+tmp1[k];
+    adj_cross(tmp, zbar_lin, parent_ang);
+    for (int k = 0; k < 3; ++k) bar_cdof[6*dof+3+k] += tmp[k];
+  }
+
+  int root = 1;
+  for (int body = 1; body < nbody; ++body) {
+    if (!m->body_jntnum[body]) continue;
+    int joint = m->body_jntadr[body];
+    int dof = m->jnt_dofadr[joint];
+    const mjtNum* axis = d->xaxis+3*joint;
+    const mjtNum* cot = bar_cdof+6*dof;
+    mjtNum r[3], axis_bar[3], root_com_bar[3], tmp[3];
+    adj_sub3(r, d->subtree_com+3*root, d->xpos+3*body);
+    adj_cross(tmp, r, cot+3);
+    for (int k = 0; k < 3; ++k) axis_bar[k] = cot[k]+tmp[k];
+    adj_cross(root_com_bar, cot+3, axis);
+    for (int k = 0; k < 3; ++k) {
+      bar_pos[3*body+k] -= root_com_bar[k];
+    }
+    mjtNum quat_bar[4], axis_output_bar[3];
+    adj_rotVecQuatVjp(quat_bar, axis_output_bar, d->xquat+4*body,
+                      m->jnt_axis+3*joint, axis_bar);
+    for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += quat_bar[k];
+  }
+
+  for (int body = 1; body < nbody; ++body) {
+    for (int k = 0; k < 3; ++k) {
+      bar_pos[3*body+k] += bar_xipos[3*body+k];
+    }
+    mjtNum ipos_quat_bar[4], ipos_vec_bar[3];
+    adj_rotVecQuatVjp(ipos_quat_bar, ipos_vec_bar, d->xquat+4*body,
+                      m->body_ipos+3*body, bar_xipos+3*body);
+    for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += ipos_quat_bar[k];
+
+    mjtNum inertia_quat[4], dqi[4] = {0, 0, 0, 0};
+    mju_mulQuat(inertia_quat, d->xquat+4*body, m->body_iquat+4*body);
+    for (int col = 0; col < 3; ++col) {
+      mjtNum basis_cot[3];
+      for (int row = 0; row < 3; ++row) {
+        mjtNum value = 0;
+        for (int inner = 0; inner < 3; ++inner) {
+          value += (bar_rot_inertia[9*body+3*row+inner] +
+                    bar_rot_inertia[9*body+3*inner+row]) *
+                   d->ximat[9*body+3*inner+col] *
+                   m->body_inertia[3*body+col];
+        }
+        basis_cot[row] = value;
+      }
+      mjtNum basis[3] = {0, 0, 0};
+      basis[col] = 1;
+      mjtNum col_quat_bar[4], col_vec_bar[3];
+      adj_rotVecQuatVjp(col_quat_bar, col_vec_bar, inertia_quat, basis,
+                        basis_cot);
+      for (int k = 0; k < 4; ++k) dqi[k] += col_quat_bar[k];
+    }
+    mjtNum left_bar[4], right_bar[4];
+    adj_mulQuatVjp(left_bar, right_bar, d->xquat+4*body,
+                   m->body_iquat+4*body, dqi);
+    for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += left_bar[k];
+  }
+
+  for (int body = nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    int joint = m->body_jntnum[body] ? m->body_jntadr[body] : -1;
+    mjtNum relative_quat[4], hinge_quat[4], hinge_derivative[4];
+    mju_mulQuat(relative_quat, d->xquat+4*parent, m->body_quat+4*body);
+    mjtNum split_left_bar[4], hinge_bar[4];
+    if (joint >= 0) {
+      int qposadr = m->jnt_qposadr[joint];
+      mjtNum theta = d->qpos[qposadr] - m->qpos0[qposadr];
+      mjtNum half_theta = 0.5*theta;
+      mjtNum scalar = mju_cos(half_theta);
+      mjtNum vector_scale = mju_sin(half_theta);
+      hinge_quat[0] = scalar;
+      hinge_derivative[0] = -0.5*vector_scale;
+      for (int k = 0; k < 3; ++k) {
+        hinge_quat[k+1] = vector_scale*m->jnt_axis[3*joint+k];
+        hinge_derivative[k+1] = 0.5*scalar*m->jnt_axis[3*joint+k];
+      }
+      adj_mulQuatVjp(split_left_bar, hinge_bar, relative_quat, hinge_quat,
+                     bar_quat+4*body);
+      dbar_qpos[m->jnt_dofadr[joint]] +=
+          mju_dot(hinge_derivative, hinge_bar, 4);
+    } else {
+      for (int k = 0; k < 4; ++k) split_left_bar[k] = bar_quat[4*body+k];
+    }
+
+    if (parent) {
+      mjtNum parent_left_bar[4], parent_right_bar[4];
+      adj_mulQuatVjp(parent_left_bar, parent_right_bar,
+                     d->xquat+4*parent, m->body_quat+4*body,
+                     split_left_bar);
+      for (int k = 0; k < 4; ++k) bar_quat[4*parent+k] += parent_left_bar[k];
+
+      mjtNum bodypos_quat_bar[4], bodypos_vec_bar[3];
+      adj_rotVecQuatVjp(bodypos_quat_bar, bodypos_vec_bar,
+                        d->xquat+4*parent, m->body_pos+3*body,
+                        bar_pos+3*body);
+      for (int k = 0; k < 4; ++k) {
+        bar_quat[4*parent+k] += bodypos_quat_bar[k];
+      }
+      for (int k = 0; k < 3; ++k) {
+        bar_pos[3*parent+k] += bodypos_vec_bar[k];
+      }
+    }
+  }
+
+  mj_freeStack(d);
+  return mjADJ_OK;
+}
+
 int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
                           const mjtNum* bar_qfrc_bias, mjtNum* dbar_qpos) {
   if (!m || !d || (m->nv && (!bar_qfrc_bias || !dbar_qpos))) {
@@ -1218,6 +1565,10 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
     return mjADJ_INVALID_ARGUMENT;
   }
   mju_zero(dbar_qpos, m->nv);
+  if (centered_zero_anchor_hinge_tree(m)) {
+    return centered_zero_anchor_hinge_bias_pos_adjoint(
+        m, d, bar_qfrc_bias, dbar_qpos);
+  }
   mj_markStack(d);
   mjtNum* storage = mjSTACKALLOC(d, 75*m->nbody, mjtNum);
   mju_zero(storage, 75*m->nbody);
