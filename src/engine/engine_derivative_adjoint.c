@@ -1401,6 +1401,7 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
         }
       }
     }
+    mjtNum contribution = 0;
     for (int row_body = 1; row_body < m->nbody; ++row_body) {
       if (!m->body_jntnum[row_body] || (free_root && row_body == 1)) continue;
       int row_joint = m->body_jntadr[row_body];
@@ -1435,11 +1436,11 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
           mju_copy(value, force+3*body, 3);
           mju_copy(delta_value, delta_force+3*body, 3);
         }
-        mjtNum contribution = bar_qfrc_bias[row_dof]*(
+        contribution += bar_qfrc_bias[row_dof]*(
             mju_dot3(delta_axis, value) + mju_dot3(axes+3*row_body, delta_value));
-        dbar_qpos[dof] += contribution;
       }
     }
+    dbar_qpos[dof] += contribution;
   }
   }
   mj_freeStack(d);
