@@ -1171,6 +1171,16 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   mjtNum* com = storage+42*m->nbody;
   mjtNum* delta_force = storage+45*m->nbody;
   mjtNum* delta_moment = storage+48*m->nbody;
+  int use_masks = m->nbody <= 64;
+  uint64_t* ancestor_mask = NULL;
+  if (use_masks) {
+    ancestor_mask = mjSTACKALLOC(d, m->nbody, uint64_t);
+    ancestor_mask[0] = 1;
+    for (int body = 1; body < m->nbody; ++body) {
+      ancestor_mask[body] =
+          ancestor_mask[m->body_parentid[body]] | (UINT64_C(1) << body);
+    }
+  }
   if (!mjDISABLED(mjDSBL_GRAVITY)) {
     mju_scl3(acc, m->opt.gravity, -1);
   }
@@ -1248,11 +1258,17 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       mju_zero(delta_pos, 15*m->nbody);
     mju_zero(delta_force, 6*m->nbody);
     for (int body = joint_body; body < m->nbody; ++body) {
-      int ancestor = body;
-      while (ancestor != joint_body && ancestor > 0) {
-        ancestor = m->body_parentid[ancestor];
+      int is_descendant;
+      if (use_masks) {
+        is_descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
+      } else {
+        int ancestor = body;
+        while (ancestor != joint_body && ancestor > 0) {
+          ancestor = m->body_parentid[ancestor];
+        }
+        is_descendant = ancestor == joint_body;
       }
-      if (ancestor != joint_body) continue;
+      if (!is_descendant) continue;
       if (rotating) {
         mjtNum offset[3];
         mju_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
@@ -1264,11 +1280,17 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
 
     for (int body = 1; body < m->nbody; ++body) {
       int parent = m->body_parentid[body];
-      int ancestor = body;
-      while (ancestor != joint_body && ancestor > 0) {
-        ancestor = m->body_parentid[ancestor];
+      int is_descendant;
+      if (use_masks) {
+        is_descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
+      } else {
+        int ancestor = body;
+        while (ancestor != joint_body && ancestor > 0) {
+          ancestor = m->body_parentid[ancestor];
+        }
+        is_descendant = ancestor == joint_body;
       }
-      if (ancestor != joint_body) continue;
+      if (!is_descendant) continue;
       int body_joint = m->body_jntnum[body] ? m->body_jntadr[body] : -1;
       if (free_root && body == 1) body_joint = -1;
       int body_dof = body_joint >= 0 ? m->jnt_dofadr[body_joint] : -1;
@@ -1407,20 +1429,32 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       int row_joint = m->body_jntadr[row_body];
       int row_dof = m->jnt_dofadr[row_joint];
       int row_rotating = m->jnt_type[row_joint] == mjJNT_HINGE;
-      int ancestor = row_body;
-      while (ancestor != joint_body && ancestor > 0) {
-        ancestor = m->body_parentid[ancestor];
+      int row_is_descendant;
+      if (use_masks) {
+        row_is_descendant = (int)((ancestor_mask[row_body] >> joint_body) & 1);
+      } else {
+        int ancestor = row_body;
+        while (ancestor != joint_body && ancestor > 0) {
+          ancestor = m->body_parentid[ancestor];
+        }
+        row_is_descendant = ancestor == joint_body;
       }
       mjtNum delta_axis[3] = {0, 0, 0};
-      if (rotating && ancestor == joint_body) {
+      if (rotating && row_is_descendant) {
         mju_cross(delta_axis, perturb_axis, axes+3*row_body);
       }
       for (int body = row_body; body < m->nbody; ++body) {
-        ancestor = body;
-        while (ancestor != row_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
+        int is_subtree;
+        if (use_masks) {
+          is_subtree = (int)((ancestor_mask[body] >> row_body) & 1);
+        } else {
+          int ancestor = body;
+          while (ancestor != row_body && ancestor > 0) {
+            ancestor = m->body_parentid[ancestor];
+          }
+          is_subtree = ancestor == row_body;
         }
-        if (ancestor != row_body) continue;
+        if (!is_subtree) continue;
         mjtNum value[3], delta_value[3];
         if (row_rotating) {
           mjtNum offset[3], delta_offset[3], tmp[3];
