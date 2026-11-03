@@ -3270,8 +3270,9 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
       } else {
         mju_mulMatVec3(axis, d->xmat+9*joint_body, m->jnt_axis+3*joint);
       }
+      // delta_pos is fully assigned below; clearing the four tangent arrays
+      // is sufficient for each input column.
       mju_zero(delta_angular_all, 12*m->nbody);
-      mju_zero(delta_pos, 3*m->nbody);
       for (int body = joint_body; body < m->nbody; ++body) {
         int ancestor = body;
         while (ancestor != joint_body && ancestor > 0) {
