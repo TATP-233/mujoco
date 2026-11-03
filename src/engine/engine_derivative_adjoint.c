@@ -1470,8 +1470,9 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
           mju_copy(value, force+3*body, 3);
           mju_copy(delta_value, delta_force+3*body, 3);
         }
-        contribution += bar_qfrc_bias[row_dof]*(
-            mju_dot3(delta_axis, value) + mju_dot3(axes+3*row_body, delta_value));
+        mjtNum row_bar = bar_qfrc_bias[row_dof];
+        contribution += row_bar*mju_dot3(delta_axis, value) +
+                        row_bar*mju_dot3(axes+3*row_body, delta_value);
       }
     }
     dbar_qpos[dof] += contribution;
