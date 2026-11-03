@@ -187,9 +187,16 @@ if(MUJOCO_ENABLE_AVX_INTRINSICS)
   target_compile_definitions(mujoco PUBLIC mjUSEPLATFORMSIMD)
 endif()
 
+set(MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS "")
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN AND
+   (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  set(MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS -fno-semantic-interposition)
+endif()
+
 target_compile_options(
   mujoco
   PRIVATE ${AVX_COMPILE_OPTIONS}
+          ${MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS}
           ${MUJOCO_MACOS_COMPILE_OPTIONS}
           ${EXTRA_COMPILE_OPTIONS}
           ${MUJOCO_CXX_FLAGS}
@@ -200,6 +207,12 @@ target_link_options(
   ${MUJOCO_MACOS_LINK_OPTIONS}
   ${EXTRA_LINK_OPTIONS}
 )
+
+# MuJoCo's public entry points remain dynamically bound, but intra-library calls do not need
+# ELF interposition.  Binding them locally lets the compiler devirtualize/inlien its own helpers.
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+  target_link_options(mujoco PRIVATE "LINKER:-Bsymbolic-functions")
+endif()
 
 target_link_libraries(
   mujoco
