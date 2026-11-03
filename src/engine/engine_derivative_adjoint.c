@@ -1152,8 +1152,8 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   }
   mju_zero(dbar_qpos, m->nv);
   mj_markStack(d);
-  mjtNum* storage = mjSTACKALLOC(d, 51*m->nbody, mjtNum);
-  mju_zero(storage, 51*m->nbody);
+  mjtNum* storage = mjSTACKALLOC(d, 75*m->nbody, mjtNum);
+  mju_zero(storage, 75*m->nbody);
   mjtNum* omega = storage;
   mjtNum* velocity = storage+3*m->nbody;
   mjtNum* alpha = storage+6*m->nbody;
@@ -1171,6 +1171,14 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   mjtNum* com = storage+42*m->nbody;
   mjtNum* delta_force = storage+45*m->nbody;
   mjtNum* delta_moment = storage+48*m->nbody;
+  mjtNum* subtree_force = storage+51*m->nbody;
+  mjtNum* subtree_moment = storage+54*m->nbody;
+  mjtNum* subtree_position_force = storage+57*m->nbody;
+  mjtNum* row_axis_value = storage+60*m->nbody;
+  mjtNum* delta_force_sum = storage+63*m->nbody;
+  mjtNum* delta_moment_sum = storage+66*m->nbody;
+  mjtNum* delta_position_force = storage+69*m->nbody;
+  mjtNum* position_delta_force = storage+72*m->nbody;
   int use_masks = m->nbody <= 64;
   uint64_t* ancestor_mask = NULL;
   if (use_masks) {
@@ -1234,6 +1242,37 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
     mju_addTo3(moment+3*body, tmp);
   }
   mjtNum* local_force = force;
+
+  // Precompute the static part projected by each row's axis.  For a hinge row
+  // r, V_r = sum_{s in subtree(r)} [moment_s+(x_s-x_r)x force_s].  For a slide
+  // row the original implementation projects only subtree force.
+  for (int body = 1; body < m->nbody; ++body) {
+    mjtNum tmp[3];
+    mju_copy3(subtree_force+3*body, force+3*body);
+    mju_copy3(subtree_moment+3*body, moment+3*body);
+    mju_cross(tmp, d->xpos+3*body, force+3*body);
+    mju_copy3(subtree_position_force+3*body, tmp);
+  }
+  for (int body = m->nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    if (!parent) continue;
+    mju_addTo3(subtree_force+3*parent, subtree_force+3*body);
+    mju_addTo3(subtree_moment+3*parent, subtree_moment+3*body);
+    mju_addTo3(subtree_position_force+3*parent,
+               subtree_position_force+3*body);
+  }
+  for (int body = 1; body < m->nbody; ++body) {
+    if (!m->body_jntnum[body] || (free_root && body == 1)) continue;
+    mjtNum row_value[3], origin_force[3];
+    if (m->jnt_type[m->body_jntadr[body]] == mjJNT_HINGE) {
+      mju_cross(origin_force, d->xpos+3*body, subtree_force+3*body);
+      mju_sub3(row_value, subtree_moment+3*body, origin_force);
+      mju_addTo3(row_value, subtree_position_force+3*body);
+    } else {
+      mju_copy3(row_value, subtree_force+3*body);
+    }
+    mju_cross(row_axis_value+3*body, axes+3*body, row_value);
+  }
 
   for (int joint = 0; joint < m->njnt; ++joint) {
     int joint_body = m->jnt_bodyid[joint];
@@ -1423,6 +1462,29 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
         }
       }
     }
+    // Factor the row-body x descendant output sweep.  For a hinge row,
+    // sum(dm + (dp-dp_r)x f + (x-x_r)x df) is represented below by subtree
+    // sums; for a slide row only delta-force is projected.
+    for (int body = 1; body < m->nbody; ++body) {
+      mjtNum tmp[3];
+      mju_copy3(delta_force_sum+3*body, delta_force+3*body);
+      mju_copy3(delta_moment_sum+3*body, delta_moment+3*body);
+      mju_cross(tmp, delta_pos+3*body, force+3*body);
+      mju_copy3(delta_position_force+3*body, tmp);
+      mju_cross(tmp, d->xpos+3*body, delta_force+3*body);
+      mju_copy3(position_delta_force+3*body, tmp);
+    }
+    for (int body = m->nbody-1; body > 0; --body) {
+      int parent = m->body_parentid[body];
+      if (!parent) continue;
+      mju_addTo3(delta_force_sum+3*parent, delta_force_sum+3*body);
+      mju_addTo3(delta_moment_sum+3*parent, delta_moment_sum+3*body);
+      mju_addTo3(delta_position_force+3*parent,
+                 delta_position_force+3*body);
+      mju_addTo3(position_delta_force+3*parent,
+                 position_delta_force+3*body);
+    }
+
     mjtNum contribution = 0;
     for (int row_body = 1; row_body < m->nbody; ++row_body) {
       if (!m->body_jntnum[row_body] || (free_root && row_body == 1)) continue;
@@ -1439,41 +1501,29 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
         }
         row_is_descendant = ancestor == joint_body;
       }
-      mjtNum delta_axis[3] = {0, 0, 0};
+
+      mjtNum row_delta[3];
+      if (row_rotating) {
+        mjtNum origin_delta[3];
+        mju_add3(row_delta, delta_moment_sum+3*row_body,
+                 delta_position_force+3*row_body);
+        mju_addTo3(row_delta, position_delta_force+3*row_body);
+        mju_cross(origin_delta, delta_pos+3*row_body,
+                  subtree_force+3*row_body);
+        mju_subFrom3(row_delta, origin_delta);
+        mju_cross(origin_delta, d->xpos+3*row_body,
+                  delta_force_sum+3*row_body);
+        mju_subFrom3(row_delta, origin_delta);
+      } else {
+        mju_copy3(row_delta, delta_force_sum+3*row_body);
+      }
+
+      mjtNum row_bar = bar_qfrc_bias[row_dof];
       if (rotating && row_is_descendant) {
-        mju_cross(delta_axis, perturb_axis, axes+3*row_body);
+        contribution += row_bar*mju_dot3(perturb_axis,
+                                         row_axis_value+3*row_body);
       }
-      for (int body = row_body; body < m->nbody; ++body) {
-        int is_subtree;
-        if (use_masks) {
-          is_subtree = (int)((ancestor_mask[body] >> row_body) & 1);
-        } else {
-          int ancestor = body;
-          while (ancestor != row_body && ancestor > 0) {
-            ancestor = m->body_parentid[ancestor];
-          }
-          is_subtree = ancestor == row_body;
-        }
-        if (!is_subtree) continue;
-        mjtNum value[3], delta_value[3];
-        if (row_rotating) {
-          mjtNum offset[3], delta_offset[3], tmp[3];
-          mju_sub3(offset, d->xpos+3*body, d->xpos+3*row_body);
-          mju_sub3(delta_offset, delta_pos+3*body, delta_pos+3*row_body);
-          mju_cross(tmp, offset, force+3*body);
-          mju_add3(value, moment+3*body, tmp);
-          mju_cross(tmp, delta_offset, force+3*body);
-          mju_add3(delta_value, delta_moment+3*body, tmp);
-          mju_cross(tmp, offset, delta_force+3*body);
-          mju_addTo3(delta_value, tmp);
-        } else {
-          mju_copy(value, force+3*body, 3);
-          mju_copy(delta_value, delta_force+3*body, 3);
-        }
-        mjtNum row_bar = bar_qfrc_bias[row_dof];
-        contribution += row_bar*mju_dot3(delta_axis, value) +
-                        row_bar*mju_dot3(axes+3*row_body, delta_value);
-      }
+      contribution += row_bar*mju_dot3(axes+3*row_body, row_delta);
     }
     dbar_qpos[dof] += contribution;
   }
