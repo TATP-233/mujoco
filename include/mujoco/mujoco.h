@@ -23,6 +23,7 @@
 #include <math.h>
 
 // type definitions
+#include <mujoco/mjadjoint.h>
 #include <mujoco/mjdata.h>
 #include <mujoco/mjexport.h>
 #include <mujoco/mjmodel.h>

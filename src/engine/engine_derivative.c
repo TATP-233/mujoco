@@ -596,7 +596,7 @@ static void mjd_comVel_vel(const mjModel* m, mjData* d, mjtNum* Dcvel, mjtNum* D
 
 
 // subtract d qfrc_bias / d qvel from qDeriv
-static void mjd_rne_vel(const mjModel* m, mjData* d) {
+void mjd_rne_vel(const mjModel* m, mjData* d, mjtNum* qDeriv) {
   int nM = m->nM;
   int sleep_filter = mjENABLED(mjENBL_SLEEP) && d->nbody_awake < m->nbody;
   int nbody = sleep_filter ? d->nbody_awake : m->nbody;
@@ -701,7 +701,7 @@ static void mjd_rne_vel(const mjModel* m, mjData* d) {
 
     // qDeriv -= D(cdof * cfrc_body)
     mju_mulMatVec(row, Dcfrcbody + 6*Badr[i], d->cdof + 6*j, Bnnz[i], 6);
-    mju_subFrom(d->qDeriv + Dadr[j], row, Bnnz[i]);
+    mju_subFrom(qDeriv + Dadr[j], row, Bnnz[i]);
   }
 
   mj_freeStack(d);
@@ -2825,7 +2825,7 @@ void mjd_smooth_vel(const mjModel* m, mjData* d, int flg_bias) {
 
   // qDeriv -= d qfrc_bias / d qvel; optional
   if (flg_bias) {
-    mjd_rne_vel(m, d);
+    mjd_rne_vel(m, d, d->qDeriv);
   }
 }
 

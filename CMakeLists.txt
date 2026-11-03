@@ -113,6 +113,7 @@ include(MujocoDependencies)
 
 set(MUJOCO_HEADERS
     include/mujoco/mjassert.h
+    include/mujoco/mjadjoint.h
     include/mujoco/mjdata.h
     include/mujoco/mjexport.h
     include/mujoco/mjmacro.h
@@ -213,8 +214,10 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(mujoco PRIVATE Threads::Threads)
 endif()
 
+set(MUJOCO_LIBRARY_NAME "mujoco" CACHE STRING "Output name of the MuJoCo shared library")
 set_target_properties(
-  mujoco PROPERTIES VERSION "${mujoco_VERSION}" PUBLIC_HEADER "${MUJOCO_HEADERS}"
+  mujoco PROPERTIES OUTPUT_NAME "${MUJOCO_LIBRARY_NAME}" VERSION "${mujoco_VERSION}"
+                    PUBLIC_HEADER "${MUJOCO_HEADERS}"
 )
 
 # CMake's built-in FRAMEWORK option doesn't give us control over the dylib name inside the

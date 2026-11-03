@@ -40,6 +40,9 @@ MJAPI void mjd_actuator_vel(const mjModel* m, mjData* d);
 // add (d qfrc_passive / d qvel) to qDeriv
 MJAPI void mjd_passive_vel(const mjModel* m, mjData* d);
 
+// subtract (d qfrc_bias / d qvel) from qDeriv (sparse version)
+MJAPI void mjd_rne_vel(const mjModel* m, mjData* d, mjtNum* qDeriv);
+
 // subtract (d qfrc_bias / d qvel) from qDeriv (dense version)
 MJAPI void mjd_rne_vel_dense(const mjModel* m, mjData* d);
 
