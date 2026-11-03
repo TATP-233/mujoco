@@ -1256,6 +1256,14 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
           ancestor_mask[m->body_parentid[body]] | (UINT64_C(1) << body);
     }
   }
+  int* descendant_end = mjSTACKALLOC(d, m->nbody, int);
+  for (int body = 1; body < m->nbody; ++body) descendant_end[body] = body+1;
+  for (int body = m->nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    if (parent && descendant_end[parent] < descendant_end[body]) {
+      descendant_end[parent] = descendant_end[body];
+    }
+  }
   if (!mjDISABLED(mjDSBL_GRAVITY)) {
     adj_scl3(acc, m->opt.gravity, -1);
   }
@@ -1363,18 +1371,8 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       }
       mju_zero(delta_pos, 15*m->nbody);
     mju_zero(delta_force, 6*m->nbody);
-    for (int body = joint_body; body < m->nbody; ++body) {
-      int is_descendant;
-      if (use_masks) {
-        is_descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
-      } else {
-        int ancestor = body;
-        while (ancestor != joint_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
-        }
-        is_descendant = ancestor == joint_body;
-      }
-      if (!is_descendant) continue;
+    int tree_end = descendant_end[joint_body];
+    for (int body = joint_body; body < tree_end; ++body) {
       if (rotating) {
         mjtNum offset[3];
         adj_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
@@ -1384,19 +1382,8 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       }
     }
 
-    for (int body = 1; body < m->nbody; ++body) {
+    for (int body = joint_body; body < tree_end; ++body) {
       int parent = m->body_parentid[body];
-      int is_descendant;
-      if (use_masks) {
-        is_descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
-      } else {
-        int ancestor = body;
-        while (ancestor != joint_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
-        }
-        is_descendant = ancestor == joint_body;
-      }
-      if (!is_descendant) continue;
       int body_joint = m->body_jntnum[body] ? m->body_jntadr[body] : -1;
       if (free_root && body == 1) body_joint = -1;
       int body_dof = body_joint >= 0 ? m->jnt_dofadr[body_joint] : -1;
@@ -1558,16 +1545,7 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       int row_joint = m->body_jntadr[row_body];
       int row_dof = m->jnt_dofadr[row_joint];
       int row_rotating = m->jnt_type[row_joint] == mjJNT_HINGE;
-      int row_is_descendant;
-      if (use_masks) {
-        row_is_descendant = (int)((ancestor_mask[row_body] >> joint_body) & 1);
-      } else {
-        int ancestor = row_body;
-        while (ancestor != joint_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
-        }
-        row_is_descendant = ancestor == joint_body;
-      }
+      int row_is_descendant = row_body >= joint_body && row_body < tree_end;
 
       mjtNum row_delta[3];
       if (row_rotating) {
@@ -3363,6 +3341,14 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
           ancestor_mask[m->body_parentid[body]] | (UINT64_C(1) << body);
     }
   }
+  int* descendant_end = mjSTACKALLOC(d, m->nbody, int);
+  for (int body = 1; body < m->nbody; ++body) descendant_end[body] = body+1;
+  for (int body = m->nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    if (parent && descendant_end[parent] < descendant_end[body]) {
+      descendant_end[parent] = descendant_end[body];
+    }
+  }
   for (int body = 1; body < m->nbody; ++body) {
     int parent = m->body_parentid[body];
     mjtNum offset[3];
@@ -3442,18 +3428,8 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
       // delta_pos is fully assigned below; clearing the four tangent arrays
       // is sufficient for each input column.
       mju_zero(delta_angular_all, 12*m->nbody);
-      for (int body = 1; body < m->nbody; ++body) {
-        int descendant;
-        if (use_masks) {
-          descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
-        } else {
-          int ancestor = body;
-          while (ancestor != joint_body && ancestor > 0) {
-            ancestor = m->body_parentid[ancestor];
-          }
-          descendant = ancestor == joint_body;
-        }
-        if (!descendant) continue;
+      int tree_end = descendant_end[joint_body];
+      for (int body = joint_body; body < tree_end; ++body) {
         if (rotating) {
           mjtNum offset[3];
           adj_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
@@ -3462,18 +3438,7 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
           adj_copy3(delta_pos+3*body, axis);
         }
       }
-    for (int body = 1; body < m->nbody; ++body) {
-      int descendant;
-      if (use_masks) {
-        descendant = (int)((ancestor_mask[body] >> joint_body) & 1);
-      } else {
-        int ancestor = body;
-        while (ancestor != joint_body && ancestor > 0) {
-          ancestor = m->body_parentid[ancestor];
-        }
-        descendant = ancestor == joint_body;
-      }
-      if (!descendant) continue;
+    for (int body = joint_body; body < tree_end; ++body) {
       const mjtNum* com = com_all+3*body;
       mjtNum mass = m->body_mass[body];
       mjtNum* force = force_all+3*body;
