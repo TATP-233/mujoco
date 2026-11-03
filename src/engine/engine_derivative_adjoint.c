@@ -1128,6 +1128,73 @@ int mjd_smoothAccCtrlAdjoint(const mjModel* m, const mjData* d,
   return mjd_actuatorCtrlAdjoint(m, d, y, dbar_ctrl);
 }
 
+
+// Fixed-size spatial algebra primitives.  These are kept local to the RNE
+// position VJP so the shared library's default symbol interposition does not
+// force length-3 BLAS helpers through the PLT in its innermost recursions.
+static inline void adj_copy3(mjtNum out[3], const mjtNum in[3]) {
+  out[0] = in[0]; out[1] = in[1]; out[2] = in[2];
+}
+
+static inline void adj_zero3(mjtNum out[3]) {
+  out[0] = out[1] = out[2] = 0;
+}
+
+static inline void adj_add3(mjtNum out[3], const mjtNum a[3],
+                            const mjtNum b[3]) {
+  out[0] = a[0]+b[0]; out[1] = a[1]+b[1]; out[2] = a[2]+b[2];
+}
+
+static inline void adj_sub3(mjtNum out[3], const mjtNum a[3],
+                            const mjtNum b[3]) {
+  out[0] = a[0]-b[0]; out[1] = a[1]-b[1]; out[2] = a[2]-b[2];
+}
+
+static inline void adj_addTo3(mjtNum out[3], const mjtNum a[3]) {
+  out[0] += a[0]; out[1] += a[1]; out[2] += a[2];
+}
+
+static inline void adj_subFrom3(mjtNum out[3], const mjtNum a[3]) {
+  out[0] -= a[0]; out[1] -= a[1]; out[2] -= a[2];
+}
+
+static inline void adj_scl3(mjtNum out[3], const mjtNum a[3], mjtNum scale) {
+  out[0] = scale*a[0]; out[1] = scale*a[1]; out[2] = scale*a[2];
+}
+
+static inline void adj_addToScl3(mjtNum out[3], const mjtNum a[3],
+                                 mjtNum scale) {
+  out[0] += scale*a[0]; out[1] += scale*a[1]; out[2] += scale*a[2];
+}
+
+static inline mjtNum adj_dot3(const mjtNum a[3], const mjtNum b[3]) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+static inline void adj_cross(mjtNum out[3], const mjtNum a[3],
+                             const mjtNum b[3]) {
+  mjtNum x = a[1]*b[2] - a[2]*b[1];
+  mjtNum y = a[2]*b[0] - a[0]*b[2];
+  mjtNum z = a[0]*b[1] - a[1]*b[0];
+  out[0] = x; out[1] = y; out[2] = z;
+}
+
+static inline void adj_mulMatVec3(mjtNum out[3], const mjtNum mat[9],
+                                  const mjtNum vec[3]) {
+  mjtNum x = mat[0]*vec[0] + mat[1]*vec[1] + mat[2]*vec[2];
+  mjtNum y = mat[3]*vec[0] + mat[4]*vec[1] + mat[5]*vec[2];
+  mjtNum z = mat[6]*vec[0] + mat[7]*vec[1] + mat[8]*vec[2];
+  out[0] = x; out[1] = y; out[2] = z;
+}
+
+static inline void adj_mulMatTVec3(mjtNum out[3], const mjtNum mat[9],
+                                   const mjtNum vec[3]) {
+  mjtNum x = mat[0]*vec[0] + mat[3]*vec[1] + mat[6]*vec[2];
+  mjtNum y = mat[1]*vec[0] + mat[4]*vec[1] + mat[7]*vec[2];
+  mjtNum z = mat[2]*vec[0] + mat[5]*vec[1] + mat[8]*vec[2];
+  out[0] = x; out[1] = y; out[2] = z;
+}
+
 static void body_inertia_mul(const mjModel* m, const mjData* d, int body,
                              const mjtNum vector[3], mjtNum result[3]) {
   const mjtNum* rotation = d->ximat + 9*body;
@@ -1190,56 +1257,56 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
     }
   }
   if (!mjDISABLED(mjDSBL_GRAVITY)) {
-    mju_scl3(acc, m->opt.gravity, -1);
+    adj_scl3(acc, m->opt.gravity, -1);
   }
 
   for (int body = 1; body < m->nbody; ++body) {
     int parent = m->body_parentid[body];
     mjtNum offset[3], tmp[3], tmp1[3];
-    mju_sub3(offset, d->xpos+3*body, d->xpos+3*parent);
-    mju_copy(omega+3*body, omega+3*parent, 3);
-    mju_copy(alpha+3*body, alpha+3*parent, 3);
-    mju_cross(velocity+3*body, omega+3*parent, offset);
-    mju_addTo3(velocity+3*body, velocity+3*parent);
-    mju_cross(acc+3*body, alpha+3*parent, offset);
-    mju_addTo3(acc+3*body, acc+3*parent);
-    mju_cross(tmp, omega+3*parent, offset);
-    mju_cross(tmp1, omega+3*parent, tmp);
-    mju_addTo3(acc+3*body, tmp1);
+    adj_sub3(offset, d->xpos+3*body, d->xpos+3*parent);
+    adj_copy3(omega+3*body, omega+3*parent);
+    adj_copy3(alpha+3*body, alpha+3*parent);
+    adj_cross(velocity+3*body, omega+3*parent, offset);
+    adj_addTo3(velocity+3*body, velocity+3*parent);
+    adj_cross(acc+3*body, alpha+3*parent, offset);
+    adj_addTo3(acc+3*body, acc+3*parent);
+    adj_cross(tmp, omega+3*parent, offset);
+    adj_cross(tmp1, omega+3*parent, tmp);
+    adj_addTo3(acc+3*body, tmp1);
     if (free_root && body == 1) {
-      mju_mulMatVec3(omega+3*body, d->xmat+9*body, d->qvel+3);
+      adj_mulMatVec3(omega+3*body, d->xmat+9*body, d->qvel+3);
       mju_copy(velocity+3*body, d->qvel, 3);
     }
     if (m->body_jntnum[body] && !(free_root && body == 1)) {
       int joint = m->body_jntadr[body];
       int dof = m->jnt_dofadr[joint];
-      mju_mulMatVec3(axes+3*body, d->xmat+9*body, m->jnt_axis+3*joint);
-      mju_scl3(tmp, axes+3*body, d->qvel[dof]);
+      adj_mulMatVec3(axes+3*body, d->xmat+9*body, m->jnt_axis+3*joint);
+      adj_scl3(tmp, axes+3*body, d->qvel[dof]);
       if (m->jnt_type[joint] == mjJNT_HINGE) {
-        mju_addTo3(omega+3*body, tmp);
-        mju_cross(tmp1, omega+3*parent, tmp);
-        mju_addTo3(alpha+3*body, tmp1);
+        adj_addTo3(omega+3*body, tmp);
+        adj_cross(tmp1, omega+3*parent, tmp);
+        adj_addTo3(alpha+3*body, tmp1);
       } else {
-        mju_addTo3(velocity+3*body, tmp);
-        mju_cross(tmp1, omega+3*parent, tmp);
-        mju_scl3(tmp1, tmp1, 2);
-        mju_addTo3(acc+3*body, tmp1);
+        adj_addTo3(velocity+3*body, tmp);
+        adj_cross(tmp1, omega+3*parent, tmp);
+        adj_scl3(tmp1, tmp1, 2);
+        adj_addTo3(acc+3*body, tmp1);
       }
     }
-    mju_mulMatVec3(com+3*body, d->xmat+9*body, m->body_ipos+3*body);
-    mju_cross(tmp, alpha+3*body, com+3*body);
-    mju_cross(tmp1, omega+3*body, com+3*body);
+    adj_mulMatVec3(com+3*body, d->xmat+9*body, m->body_ipos+3*body);
+    adj_cross(tmp, alpha+3*body, com+3*body);
+    adj_cross(tmp1, omega+3*body, com+3*body);
     mjtNum centrifugal[3];
-    mju_cross(centrifugal, omega+3*body, tmp1);
+    adj_cross(centrifugal, omega+3*body, tmp1);
     for (int k = 0; k < 3; ++k) {
       force[3*body+k] = m->body_mass[body]*(acc[3*body+k]+tmp[k]+centrifugal[k]);
     }
     body_inertia_mul(m, d, body, alpha+3*body, inertia_alpha+3*body);
     body_inertia_mul(m, d, body, omega+3*body, inertia_omega+3*body);
-    mju_cross(moment+3*body, omega+3*body, inertia_omega+3*body);
-    mju_addTo3(moment+3*body, inertia_alpha+3*body);
-    mju_cross(tmp, com+3*body, force+3*body);
-    mju_addTo3(moment+3*body, tmp);
+    adj_cross(moment+3*body, omega+3*body, inertia_omega+3*body);
+    adj_addTo3(moment+3*body, inertia_alpha+3*body);
+    adj_cross(tmp, com+3*body, force+3*body);
+    adj_addTo3(moment+3*body, tmp);
   }
   mjtNum* local_force = force;
 
@@ -1248,30 +1315,30 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   // row the original implementation projects only subtree force.
   for (int body = 1; body < m->nbody; ++body) {
     mjtNum tmp[3];
-    mju_copy3(subtree_force+3*body, force+3*body);
-    mju_copy3(subtree_moment+3*body, moment+3*body);
-    mju_cross(tmp, d->xpos+3*body, force+3*body);
-    mju_copy3(subtree_position_force+3*body, tmp);
+    adj_copy3(subtree_force+3*body, force+3*body);
+    adj_copy3(subtree_moment+3*body, moment+3*body);
+    adj_cross(tmp, d->xpos+3*body, force+3*body);
+    adj_copy3(subtree_position_force+3*body, tmp);
   }
   for (int body = m->nbody-1; body > 0; --body) {
     int parent = m->body_parentid[body];
     if (!parent) continue;
-    mju_addTo3(subtree_force+3*parent, subtree_force+3*body);
-    mju_addTo3(subtree_moment+3*parent, subtree_moment+3*body);
-    mju_addTo3(subtree_position_force+3*parent,
+    adj_addTo3(subtree_force+3*parent, subtree_force+3*body);
+    adj_addTo3(subtree_moment+3*parent, subtree_moment+3*body);
+    adj_addTo3(subtree_position_force+3*parent,
                subtree_position_force+3*body);
   }
   for (int body = 1; body < m->nbody; ++body) {
     if (!m->body_jntnum[body] || (free_root && body == 1)) continue;
     mjtNum row_value[3], origin_force[3];
     if (m->jnt_type[m->body_jntadr[body]] == mjJNT_HINGE) {
-      mju_cross(origin_force, d->xpos+3*body, subtree_force+3*body);
-      mju_sub3(row_value, subtree_moment+3*body, origin_force);
-      mju_addTo3(row_value, subtree_position_force+3*body);
+      adj_cross(origin_force, d->xpos+3*body, subtree_force+3*body);
+      adj_sub3(row_value, subtree_moment+3*body, origin_force);
+      adj_addTo3(row_value, subtree_position_force+3*body);
     } else {
-      mju_copy3(row_value, subtree_force+3*body);
+      adj_copy3(row_value, subtree_force+3*body);
     }
-    mju_cross(row_axis_value+3*body, axes+3*body, row_value);
+    adj_cross(row_axis_value+3*body, axes+3*body, row_value);
   }
 
   for (int joint = 0; joint < m->njnt; ++joint) {
@@ -1290,7 +1357,7 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
         } else {
           mjtNum local_axis[3] = {0, 0, 0};
           local_axis[channel-3] = 1;
-          mju_mulMatVec3(free_axis, d->xmat+9*joint_body, local_axis);
+          adj_mulMatVec3(free_axis, d->xmat+9*joint_body, local_axis);
         }
         perturb_axis = free_axis;
       }
@@ -1310,8 +1377,8 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       if (!is_descendant) continue;
       if (rotating) {
         mjtNum offset[3];
-        mju_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
-        mju_cross(delta_pos+3*body, perturb_axis, offset);
+        adj_sub3(offset, d->xpos+3*body, d->xpos+3*joint_body);
+        adj_cross(delta_pos+3*body, perturb_axis, offset);
       } else {
         mju_copy(delta_pos+3*body, perturb_axis, 3);
       }
@@ -1336,69 +1403,69 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       int body_rotating = body_joint >= 0 && m->jnt_type[body_joint] == mjJNT_HINGE;
       mjtNum delta_axis[3] = {0, 0, 0};
       if (rotating && body_joint >= 0) {
-        mju_cross(delta_axis, perturb_axis, axes+3*body);
+        adj_cross(delta_axis, perturb_axis, axes+3*body);
       }
       mjtNum offset[3], delta_offset[3], tmp[3], tmp1[3], tmp2[3], tmp3[3];
-      mju_sub3(offset, d->xpos+3*body, d->xpos+3*parent);
-      mju_sub3(delta_offset, delta_pos+3*body, delta_pos+3*parent);
-      mju_copy(delta_omega+3*body, delta_omega+3*parent, 3);
-      mju_copy(delta_alpha+3*body, delta_alpha+3*parent, 3);
-      mju_cross(delta_velocity+3*body, delta_omega+3*parent, offset);
-      mju_cross(tmp, omega+3*parent, delta_offset);
-      mju_addTo3(delta_velocity+3*body, tmp);
-      mju_addTo3(delta_velocity+3*body, delta_velocity+3*parent);
-      mju_cross(delta_acc+3*body, delta_alpha+3*parent, offset);
-      mju_cross(tmp, alpha+3*parent, delta_offset);
-      mju_addTo3(delta_acc+3*body, tmp);
-      mju_addTo3(delta_acc+3*body, delta_acc+3*parent);
-      mju_cross(tmp, omega+3*parent, offset);
-      mju_cross(tmp1, delta_omega+3*parent, tmp);
-      mju_cross(tmp2, delta_omega+3*parent, offset);
-      mju_cross(tmp3, omega+3*parent, tmp2);
-      mju_addTo3(delta_acc+3*body, tmp1);
-      mju_addTo3(delta_acc+3*body, tmp3);
-      mju_cross(tmp, omega+3*parent, delta_offset);
-      mju_cross(tmp1, omega+3*parent, tmp);
-      mju_addTo3(delta_acc+3*body, tmp1);
+      adj_sub3(offset, d->xpos+3*body, d->xpos+3*parent);
+      adj_sub3(delta_offset, delta_pos+3*body, delta_pos+3*parent);
+      adj_copy3(delta_omega+3*body, delta_omega+3*parent);
+      adj_copy3(delta_alpha+3*body, delta_alpha+3*parent);
+      adj_cross(delta_velocity+3*body, delta_omega+3*parent, offset);
+      adj_cross(tmp, omega+3*parent, delta_offset);
+      adj_addTo3(delta_velocity+3*body, tmp);
+      adj_addTo3(delta_velocity+3*body, delta_velocity+3*parent);
+      adj_cross(delta_acc+3*body, delta_alpha+3*parent, offset);
+      adj_cross(tmp, alpha+3*parent, delta_offset);
+      adj_addTo3(delta_acc+3*body, tmp);
+      adj_addTo3(delta_acc+3*body, delta_acc+3*parent);
+      adj_cross(tmp, omega+3*parent, offset);
+      adj_cross(tmp1, delta_omega+3*parent, tmp);
+      adj_cross(tmp2, delta_omega+3*parent, offset);
+      adj_cross(tmp3, omega+3*parent, tmp2);
+      adj_addTo3(delta_acc+3*body, tmp1);
+      adj_addTo3(delta_acc+3*body, tmp3);
+      adj_cross(tmp, omega+3*parent, delta_offset);
+      adj_cross(tmp1, omega+3*parent, tmp);
+      adj_addTo3(delta_acc+3*body, tmp1);
       if (body_joint >= 0) {
-        mju_scl3(tmp, delta_axis, d->qvel[body_dof]);
-        mju_scl3(tmp1, axes+3*body, d->qvel[body_dof]);
+        adj_scl3(tmp, delta_axis, d->qvel[body_dof]);
+        adj_scl3(tmp1, axes+3*body, d->qvel[body_dof]);
         if (body_rotating) {
-          mju_addTo3(delta_omega+3*body, tmp);
-          mju_cross(tmp2, delta_omega+3*parent, tmp1);
-          mju_addTo3(delta_alpha+3*body, tmp2);
-          mju_cross(tmp2, omega+3*parent, tmp);
-          mju_addTo3(delta_alpha+3*body, tmp2);
+          adj_addTo3(delta_omega+3*body, tmp);
+          adj_cross(tmp2, delta_omega+3*parent, tmp1);
+          adj_addTo3(delta_alpha+3*body, tmp2);
+          adj_cross(tmp2, omega+3*parent, tmp);
+          adj_addTo3(delta_alpha+3*body, tmp2);
         } else {
-          mju_addTo3(delta_velocity+3*body, tmp);
-          mju_cross(tmp2, delta_omega+3*parent, tmp1);
-          mju_addTo3(delta_acc+3*body, tmp2);
-          mju_addTo3(delta_acc+3*body, tmp2);
-          mju_cross(tmp2, omega+3*parent, tmp);
-          mju_addTo3(delta_acc+3*body, tmp2);
-          mju_addTo3(delta_acc+3*body, tmp2);
+          adj_addTo3(delta_velocity+3*body, tmp);
+          adj_cross(tmp2, delta_omega+3*parent, tmp1);
+          adj_addTo3(delta_acc+3*body, tmp2);
+          adj_addTo3(delta_acc+3*body, tmp2);
+          adj_cross(tmp2, omega+3*parent, tmp);
+          adj_addTo3(delta_acc+3*body, tmp2);
+          adj_addTo3(delta_acc+3*body, tmp2);
         }
       }
       if (free_root && body == 1 && rotating) {
-        mju_cross(delta_omega+3*body, perturb_axis, omega+3*body);
+        adj_cross(delta_omega+3*body, perturb_axis, omega+3*body);
       }
 
       mjtNum delta_com[3] = {0, 0, 0};
-      if (rotating) mju_cross(delta_com, perturb_axis, com+3*body);
+      if (rotating) adj_cross(delta_com, perturb_axis, com+3*body);
       mjtNum* local_delta_force = delta_force+3*body;
       mjtNum* local_delta_moment = delta_moment+3*body;
-      mju_cross(tmp, delta_alpha+3*body, com+3*body);
-      mju_cross(tmp1, alpha+3*body, delta_com);
-      mju_add3(local_delta_force, tmp, tmp1);
-      mju_cross(tmp, delta_omega+3*body, com+3*body);
-      mju_cross(tmp1, omega+3*body, com+3*body);
-      mju_cross(tmp2, delta_omega+3*body, tmp1);
-      mju_addTo3(local_delta_force, tmp2);
-      mju_cross(tmp2, omega+3*body, tmp);
-      mju_addTo3(local_delta_force, tmp2);
-      mju_cross(tmp, omega+3*body, delta_com);
-      mju_cross(tmp2, omega+3*body, tmp);
-      mju_addTo3(local_delta_force, tmp2);
+      adj_cross(tmp, delta_alpha+3*body, com+3*body);
+      adj_cross(tmp1, alpha+3*body, delta_com);
+      adj_add3(local_delta_force, tmp, tmp1);
+      adj_cross(tmp, delta_omega+3*body, com+3*body);
+      adj_cross(tmp1, omega+3*body, com+3*body);
+      adj_cross(tmp2, delta_omega+3*body, tmp1);
+      adj_addTo3(local_delta_force, tmp2);
+      adj_cross(tmp2, omega+3*body, tmp);
+      adj_addTo3(local_delta_force, tmp2);
+      adj_cross(tmp, omega+3*body, delta_com);
+      adj_cross(tmp2, omega+3*body, tmp);
+      adj_addTo3(local_delta_force, tmp2);
       for (int k = 0; k < 3; ++k) {
         local_delta_force[k] = m->body_mass[body]*(delta_acc[3*body+k]+local_delta_force[k]);
       }
@@ -1406,26 +1473,26 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       body_inertia_mul(m, d, body, delta_alpha+3*body, delta_inertia_alpha);
       body_inertia_mul(m, d, body, delta_omega+3*body, delta_inertia_omega);
       if (rotating) {
-        mju_cross(tmp, perturb_axis, alpha+3*body);
+        adj_cross(tmp, perturb_axis, alpha+3*body);
         body_inertia_mul(m, d, body, tmp, tmp1);
-        mju_sub3(delta_inertia_alpha, delta_inertia_alpha, tmp1);
-        mju_cross(tmp, perturb_axis, inertia_alpha+3*body);
-        mju_addTo3(delta_inertia_alpha, tmp);
-        mju_cross(tmp, perturb_axis, omega+3*body);
+        adj_sub3(delta_inertia_alpha, delta_inertia_alpha, tmp1);
+        adj_cross(tmp, perturb_axis, inertia_alpha+3*body);
+        adj_addTo3(delta_inertia_alpha, tmp);
+        adj_cross(tmp, perturb_axis, omega+3*body);
         body_inertia_mul(m, d, body, tmp, tmp1);
-        mju_sub3(delta_inertia_omega, delta_inertia_omega, tmp1);
-        mju_cross(tmp, perturb_axis, inertia_omega+3*body);
-        mju_addTo3(delta_inertia_omega, tmp);
+        adj_sub3(delta_inertia_omega, delta_inertia_omega, tmp1);
+        adj_cross(tmp, perturb_axis, inertia_omega+3*body);
+        adj_addTo3(delta_inertia_omega, tmp);
       }
-      mju_copy(local_delta_moment, delta_inertia_alpha, 3);
-      mju_cross(tmp, delta_omega+3*body, inertia_omega+3*body);
-      mju_addTo3(local_delta_moment, tmp);
-      mju_cross(tmp, omega+3*body, delta_inertia_omega);
-      mju_addTo3(local_delta_moment, tmp);
-      mju_cross(tmp, delta_com, local_force+3*body);
-      mju_addTo3(local_delta_moment, tmp);
-      mju_cross(tmp, com+3*body, local_delta_force);
-      mju_addTo3(local_delta_moment, tmp);
+      adj_copy3(local_delta_moment, delta_inertia_alpha);
+      adj_cross(tmp, delta_omega+3*body, inertia_omega+3*body);
+      adj_addTo3(local_delta_moment, tmp);
+      adj_cross(tmp, omega+3*body, delta_inertia_omega);
+      adj_addTo3(local_delta_moment, tmp);
+      adj_cross(tmp, delta_com, local_force+3*body);
+      adj_addTo3(local_delta_moment, tmp);
+      adj_cross(tmp, com+3*body, local_delta_force);
+      adj_addTo3(local_delta_moment, tmp);
     }
     if (free_root) {
       for (int row = 0; row < 6; ++row) {
@@ -1435,30 +1502,30 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
         } else {
           mjtNum local_axis[3] = {0, 0, 0};
           local_axis[row-3] = 1;
-          mju_mulMatVec3(row_axis, d->xmat+9, local_axis);
+          adj_mulMatVec3(row_axis, d->xmat+9, local_axis);
         }
         mjtNum delta_axis[3] = {0, 0, 0};
         if (rotating && row >= 3 && joint_body == 1) {
-          mju_cross(delta_axis, perturb_axis, row_axis);
+          adj_cross(delta_axis, perturb_axis, row_axis);
         }
         for (int body = 1; body < m->nbody; ++body) {
           mjtNum value[3], delta_value[3];
           if (row < 3) {
-            mju_copy(value, force+3*body, 3);
-            mju_copy(delta_value, delta_force+3*body, 3);
+            adj_copy3(value, force+3*body);
+            adj_copy3(delta_value, delta_force+3*body);
           } else {
             mjtNum offset[3], delta_offset[3], tmp[3];
-            mju_sub3(offset, d->xpos+3*body, d->xpos+3);
-            mju_sub3(delta_offset, delta_pos+3*body, delta_pos+3);
-            mju_cross(tmp, offset, force+3*body);
-            mju_add3(value, moment+3*body, tmp);
-            mju_cross(tmp, delta_offset, force+3*body);
-            mju_add3(delta_value, delta_moment+3*body, tmp);
-            mju_cross(tmp, offset, delta_force+3*body);
-            mju_addTo3(delta_value, tmp);
+            adj_sub3(offset, d->xpos+3*body, d->xpos+3);
+            adj_sub3(delta_offset, delta_pos+3*body, delta_pos+3);
+            adj_cross(tmp, offset, force+3*body);
+            adj_add3(value, moment+3*body, tmp);
+            adj_cross(tmp, delta_offset, force+3*body);
+            adj_add3(delta_value, delta_moment+3*body, tmp);
+            adj_cross(tmp, offset, delta_force+3*body);
+            adj_addTo3(delta_value, tmp);
           }
           dbar_qpos[dof] += bar_qfrc_bias[row]*(
-              mju_dot3(delta_axis, value) + mju_dot3(row_axis, delta_value));
+              adj_dot3(delta_axis, value) + adj_dot3(row_axis, delta_value));
         }
       }
     }
@@ -1467,21 +1534,21 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
     // sums; for a slide row only delta-force is projected.
     for (int body = 1; body < m->nbody; ++body) {
       mjtNum tmp[3];
-      mju_copy3(delta_force_sum+3*body, delta_force+3*body);
-      mju_copy3(delta_moment_sum+3*body, delta_moment+3*body);
-      mju_cross(tmp, delta_pos+3*body, force+3*body);
-      mju_copy3(delta_position_force+3*body, tmp);
-      mju_cross(tmp, d->xpos+3*body, delta_force+3*body);
-      mju_copy3(position_delta_force+3*body, tmp);
+      adj_copy3(delta_force_sum+3*body, delta_force+3*body);
+      adj_copy3(delta_moment_sum+3*body, delta_moment+3*body);
+      adj_cross(tmp, delta_pos+3*body, force+3*body);
+      adj_copy3(delta_position_force+3*body, tmp);
+      adj_cross(tmp, d->xpos+3*body, delta_force+3*body);
+      adj_copy3(position_delta_force+3*body, tmp);
     }
     for (int body = m->nbody-1; body > 0; --body) {
       int parent = m->body_parentid[body];
       if (!parent) continue;
-      mju_addTo3(delta_force_sum+3*parent, delta_force_sum+3*body);
-      mju_addTo3(delta_moment_sum+3*parent, delta_moment_sum+3*body);
-      mju_addTo3(delta_position_force+3*parent,
+      adj_addTo3(delta_force_sum+3*parent, delta_force_sum+3*body);
+      adj_addTo3(delta_moment_sum+3*parent, delta_moment_sum+3*body);
+      adj_addTo3(delta_position_force+3*parent,
                  delta_position_force+3*body);
-      mju_addTo3(position_delta_force+3*parent,
+      adj_addTo3(position_delta_force+3*parent,
                  position_delta_force+3*body);
     }
 
@@ -1505,25 +1572,25 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
       mjtNum row_delta[3];
       if (row_rotating) {
         mjtNum origin_delta[3];
-        mju_add3(row_delta, delta_moment_sum+3*row_body,
+        adj_add3(row_delta, delta_moment_sum+3*row_body,
                  delta_position_force+3*row_body);
-        mju_addTo3(row_delta, position_delta_force+3*row_body);
-        mju_cross(origin_delta, delta_pos+3*row_body,
+        adj_addTo3(row_delta, position_delta_force+3*row_body);
+        adj_cross(origin_delta, delta_pos+3*row_body,
                   subtree_force+3*row_body);
-        mju_subFrom3(row_delta, origin_delta);
-        mju_cross(origin_delta, d->xpos+3*row_body,
+        adj_subFrom3(row_delta, origin_delta);
+        adj_cross(origin_delta, d->xpos+3*row_body,
                   delta_force_sum+3*row_body);
-        mju_subFrom3(row_delta, origin_delta);
+        adj_subFrom3(row_delta, origin_delta);
       } else {
-        mju_copy3(row_delta, delta_force_sum+3*row_body);
+        adj_copy3(row_delta, delta_force_sum+3*row_body);
       }
 
       mjtNum row_bar = bar_qfrc_bias[row_dof];
       if (rotating && row_is_descendant) {
-        contribution += row_bar*mju_dot3(perturb_axis,
+        contribution += row_bar*adj_dot3(perturb_axis,
                                          row_axis_value+3*row_body);
       }
-      contribution += row_bar*mju_dot3(axes+3*row_body, row_delta);
+      contribution += row_bar*adj_dot3(axes+3*row_body, row_delta);
     }
     dbar_qpos[dof] += contribution;
   }
