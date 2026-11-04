@@ -1707,9 +1707,9 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     mju_mulQuat(relative_quat, d->xquat+4*parent, m->body_quat+4*body);
     if (joint >= 0 && m->jnt_type[joint] == mjJNT_FREE) {
       int dof = m->jnt_dofadr[joint];
-      for (int k = 0; k < 3; ++k) {
-        dbar_qpos[dof+k] += bar_pos[3*body+k];
-      }
+      // Uniform gravity makes qfrc_bias invariant to a world-frame translation
+      // of the whole free-root tree.  Its three translational outputs remain
+      // exactly zero, so skip their roundoff-producing reverse sweep.
       // bar_quat is a cotangent of the normalized runtime quaternion.  The
       // freejoint qpos coordinates are raw, so project through normalization
       // before applying mj_integratePos's local-right-multiplication tangent.
@@ -1945,8 +1945,15 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   for (int joint = 0; joint < m->njnt; ++joint) {
     int joint_body = m->jnt_bodyid[joint];
     int free_joint = m->jnt_type[joint] == mjJNT_FREE;
-    int channels = free_joint ? 6 : 1;
-    for (int channel = 0; channel < channels; ++channel) {
+    int channel_start = 0;
+    int channel_end = 1;
+    if (free_joint) {
+      // Uniform gravity makes bias invariant to world-frame root translation.
+      mju_zero(dbar_qpos+m->jnt_dofadr[joint], 3);
+      channel_start = 3;
+      channel_end = 6;
+    }
+    for (int channel = channel_start; channel < channel_end; ++channel) {
       int dof = m->jnt_dofadr[joint]+channel;
       int rotating = m->jnt_type[joint] == mjJNT_HINGE ||
                      (free_joint && channel >= 3);
