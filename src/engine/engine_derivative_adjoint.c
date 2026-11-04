@@ -1308,9 +1308,11 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = 1; body < nbody; ++body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
+    int dofnum = m->body_dofnum[body];
+    int dofadr = dofnum ? m->body_dofadr[body] : -1;
     for (int k = 0; k < 6; ++k) cacc[6*body+k] = cacc[6*parent+k];
-    if (dof >= 0) {
+    for (int j = 0; j < dofnum; ++j) {
+      int dof = dofadr+j;
       for (int k = 0; k < 6; ++k) {
         cacc[6*body+k] += d->qvel[dof]*d->cdof_dot[6*dof+k];
       }
@@ -1420,8 +1422,10 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = nbody-1; body > 0; --body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
-    if (dof >= 0) {
+    int dofnum = m->body_dofnum[body];
+    int dofadr = dofnum ? m->body_dofadr[body] : -1;
+    for (int j = 0; j < dofnum; ++j) {
+      int dof = dofadr+j;
       for (int k = 0; k < 6; ++k) {
         bar_cdof_dot[6*dof+k] += d->qvel[dof]*bar_cacc[6*body+k];
       }
@@ -1433,34 +1437,56 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = nbody-1; body > 0; --body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
+    int dofnum = m->body_dofnum[body];
+    int dofadr = dofnum ? m->body_dofadr[body] : -1;
     for (int k = 0; k < 6; ++k) {
       bar_cvel[6*parent+k] += bar_cvel[6*body+k];
     }
-    if (dof < 0) continue;
-    const mjtNum* cdof = d->cdof+6*dof;
-    const mjtNum* parent_velocity = d->cvel+6*parent;
-    const mjtNum* zbar_ang = bar_cdof_dot+6*dof;
-    const mjtNum* zbar_lin = bar_cdof_dot+6*dof+3;
-    const mjtNum* cdof_ang = cdof;
-    const mjtNum* cdof_lin = cdof+3;
-    const mjtNum* parent_ang = parent_velocity;
-    const mjtNum* parent_lin = parent_velocity+3;
-    mjtNum tmp[3], tmp1[3];
+    for (int j = 0; j < dofnum; ++j) {
+      int dof = dofadr+j;
+      const mjtNum* cdof = d->cdof+6*dof;
+      const mjtNum* zbar_ang = bar_cdof_dot+6*dof;
+      const mjtNum* zbar_lin = bar_cdof_dot+6*dof+3;
+      const mjtNum* cdof_ang = cdof;
+      const mjtNum* cdof_lin = cdof+3;
+      const mjtNum* parent_ang;
+      const mjtNum* parent_lin;
+      mjtNum freejoint_pre_rotation[6];
+      int joint = m->dof_jntid[dof];
+      int skip_cross = 0;
+      if (m->jnt_type[joint] == mjJNT_FREE && j < 3) {
+        // MuJoCo explicitly zeroes the three translational freejoint channels.
+        skip_cross = 1;
+        parent_ang = NULL;
+        parent_lin = NULL;
+      } else if (m->jnt_type[joint] == mjJNT_FREE) {
+        // The rotational channels all use the local velocity after the three
+        // translational qvel contributions and before any rotational update.
+        adj_zero3(freejoint_pre_rotation);
+        adj_copy3(freejoint_pre_rotation+3, d->qvel+dofadr);
+        parent_ang = freejoint_pre_rotation;
+        parent_lin = freejoint_pre_rotation+3;
+      } else {
+        parent_ang = d->cvel+6*parent;
+        parent_lin = d->cvel+6*parent+3;
+      }
+      mjtNum tmp[3], tmp1[3];
 
-    for (int k = 0; k < 6; ++k) {
-      bar_cdof[6*dof+k] += bar_cvel[6*body+k]*d->qvel[dof];
+      for (int k = 0; k < 6; ++k) {
+        bar_cdof[6*dof+k] += bar_cvel[6*body+k]*d->qvel[dof];
+      }
+      if (skip_cross) continue;
+      adj_cross(tmp, cdof_ang, zbar_ang);
+      adj_cross(tmp1, cdof_lin, zbar_lin);
+      for (int k = 0; k < 3; ++k) bar_cvel[6*parent+k] += tmp[k]+tmp1[k];
+      adj_cross(tmp, cdof_ang, zbar_lin);
+      for (int k = 0; k < 3; ++k) bar_cvel[6*parent+3+k] += tmp[k];
+      adj_cross(tmp, zbar_ang, parent_ang);
+      adj_cross(tmp1, zbar_lin, parent_lin);
+      for (int k = 0; k < 3; ++k) bar_cdof[6*dof+k] += tmp[k]+tmp1[k];
+      adj_cross(tmp, zbar_lin, parent_ang);
+      for (int k = 0; k < 3; ++k) bar_cdof[6*dof+3+k] += tmp[k];
     }
-    adj_cross(tmp, cdof_ang, zbar_ang);
-    adj_cross(tmp1, cdof_lin, zbar_lin);
-    for (int k = 0; k < 3; ++k) bar_cvel[6*parent+k] += tmp[k]+tmp1[k];
-    adj_cross(tmp, cdof_ang, zbar_lin);
-    for (int k = 0; k < 3; ++k) bar_cvel[6*parent+3+k] += tmp[k];
-    adj_cross(tmp, zbar_ang, parent_ang);
-    adj_cross(tmp1, zbar_lin, parent_lin);
-    for (int k = 0; k < 3; ++k) bar_cdof[6*dof+k] += tmp[k]+tmp1[k];
-    adj_cross(tmp, zbar_lin, parent_ang);
-    for (int k = 0; k < 3; ++k) bar_cdof[6*dof+3+k] += tmp[k];
   }
 
   int root = 1;
@@ -1757,9 +1783,9 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   mju_zero(dbar_qpos, m->nv);
   int centered_free_root = 0;
   int centered_fast_path = centered_zero_anchor_hinge_tree(m, &centered_free_root);
-  if (centered_fast_path && centered_free_root) {
-    // The root-only derivation is for zero qvel.  Reject any nonzero root
-    // velocity so the complete generic reverse remains authoritative.
+  if (centered_fast_path && centered_free_root && m->nbody == 2) {
+    // The root-only derivation is for zero qvel.  Descendants use the complete
+    // shared-channel reverse above.
     for (int dof = 0; centered_fast_path && dof < m->nv; ++dof) {
       centered_fast_path = d->qvel[dof] == 0;
     }
