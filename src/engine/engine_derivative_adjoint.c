@@ -25,6 +25,7 @@
 #include "engine/engine_core_smooth.h"
 #include "engine/engine_core_util.h"
 #include "engine/engine_derivative.h"
+#include "engine/engine_forward.h"
 #include "engine/engine_memory.h"
 #include "engine/engine_util_errmem.h"
 #include "engine/engine_util_solve.h"
@@ -526,7 +527,14 @@ int mjd_stepAdjoint(const mjModel* m, mjData* d, mjAdjContext* ctx,
   memcpy(ctx->bar_qpos, dbar_qpos, (size_t)m->nv * sizeof(mjtNum));
   memcpy(ctx->bar_qvel, dbar_qvel, (size_t)m->nv * sizeof(mjtNum));
   ++ctx->generation;
-  mj_step(m, d);
+  if (m->opt.integrator == mjINT_IMPLICITFAST) {
+    mj_step1(m, d);
+    mjd_smooth_vel(m, d, 1);
+    memcpy(ctx->sparse_scratch, d->qDeriv, (size_t)m->nD*sizeof(mjtNum));
+    mj_step2(m, d);
+  } else {
+    mj_step(m, d);
+  }
   if (d->ncon > ctx->capacity_ncon || d->nefc > ctx->capacity_nefc ||
       d->nJ > ctx->capacity_nJ || d->nA > ctx->capacity_nA) {
     return mjADJ_ENGINE_ERROR;
@@ -736,7 +744,16 @@ int mjd_stepAdjoint(const mjModel* m, mjData* d, mjAdjContext* ctx,
     status = mjd_actuatorCtrlAdjoint(m, &backward, force_bar, ctx->grad_ctrl);
     if (status != mjADJ_OK) return status;
   }
-  if (implicit_factor) {
+  if (implicit_factor && m->opt.integrator == mjINT_IMPLICITFAST) {
+    memset(ctx->grad_qvel, 0, (size_t)m->nv*sizeof(mjtNum));
+    for (int row = 0; row < m->nv; ++row) {
+      int rowadr = m->D_rowadr[row];
+      for (int k = 0; k < m->D_rownnz[row]; ++k) {
+        ctx->grad_qvel[m->D_colind[rowadr+k]] +=
+            ctx->sparse_scratch[rowadr+k]*force_bar[row];
+      }
+    }
+  } else if (implicit_factor) {
     status = mjd_smoothVelAdjoint(m, &backward, force_bar, ctx->sparse_scratch, ctx->grad_qvel);
   } else {
     status = mjd_smoothAccVelAdjoint(m, &backward, smooth_bar, ctx->sparse_scratch,
