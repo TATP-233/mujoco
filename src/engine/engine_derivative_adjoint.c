@@ -1285,8 +1285,8 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
   int nv = m->nv;
   if (!nbody) return mjADJ_OK;
   mj_markStack(d);
-  mjtNum* storage = mjSTACKALLOC(d, 73*nbody + 12*nv, mjtNum);
-  mju_zero(storage, (size_t)(73*nbody + 12*nv));
+  mjtNum* storage = mjSTACKALLOC(d, 76*nbody + 12*nv, mjtNum);
+  mju_zero(storage, (size_t)(76*nbody + 12*nv));
 
   mjtNum* cacc = storage;
   mjtNum* force = storage + 6*nbody;
@@ -1300,6 +1300,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
   mjtNum* bar_quat = bar_rot_inertia + 9*nbody;
   mjtNum* bar_pos = bar_quat + 4*nbody;
   mjtNum* bar_xipos = bar_pos + 3*nbody;
+  mjtNum* bar_root_com = bar_xipos + 3*nbody;
 
   if (!mjDISABLED(mjDSBL_GRAVITY)) {
     adj_scl3(cacc+3, m->opt.gravity, -1);
@@ -1357,7 +1358,6 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     mjtNum offset[3], inner_bar[6];
     adj_sub3(offset, d->xipos+3*body,
              d->subtree_com+3*m->body_rootid[body]);
-    if (free_root && body == 1) adj_zero3(offset);
 
     const mjtNum* seed_ang = seed_force;
     const mjtNum* seed_lin = seed_force+3;
@@ -1413,9 +1413,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
             (2*common_a*offset[k] - common_b*cot_ang[k] -
              common_c*motion_ang[k]);
         offset_bar += body_mass*(tmp[k] + tmp1[k]);
-        if (!(free_root && body == 1)) {
-          bar_xipos[3*body+k] += offset_bar;
-        }
+        bar_xipos[3*body+k] += offset_bar;
       }
     }
   }
@@ -1470,7 +1468,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     if (!m->body_jntnum[body]) continue;
     int joint = m->body_jntadr[body];
     int dof = m->jnt_dofadr[joint];
-    if (free_root && body == 1) {
+    if (free_root && body == 1 && nbody == 2) {
       // cdof[3+k] = [a_k; a_k x r], where a_k is column k of the root
       // rotation and r = R * body_ipos.  Keep this cotangent with respect to
       // R itself; the quaternion pullback below acts directly on that map.
@@ -1530,6 +1528,63 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
       for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += quat_bar[k];
       continue;
     }
+    if (free_root && body == 1) {
+      // With descendants, cdof[3+k] = [R e_k; (R e_k) x (C-xpos)].  Keep a
+      // cotangent of R so the exact root basis-map VJP can be applied once.
+      mjtNum root_rotation_bar[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+      for (int k = 0; k < 3; ++k) {
+        const mjtNum* cot = bar_cdof+6*(dof+3+k);
+        mjtNum basis[3], r[3], basis_bar[3], com_bar[3], tmp[3];
+        basis[0] = d->xmat[9*body+k];
+        basis[1] = d->xmat[9*body+3+k];
+        basis[2] = d->xmat[9*body+6+k];
+        adj_sub3(r, d->subtree_com+3*root, d->xpos+3*body);
+        adj_cross(tmp, r, cot+3);
+        for (int i = 0; i < 3; ++i) basis_bar[i] = cot[i]+tmp[i];
+        adj_cross(com_bar, cot+3, basis);
+        for (int i = 0; i < 3; ++i) {
+          bar_root_com[i] += com_bar[i];
+          bar_pos[3*body+i] -= com_bar[i];
+        }
+        root_rotation_bar[3*0+k] += basis_bar[0];
+        root_rotation_bar[3*1+k] += basis_bar[1];
+        root_rotation_bar[3*2+k] += basis_bar[2];
+      }
+      const mjtNum* quat = d->xquat+4*body;
+      const mjtNum* vector = quat+1;
+      mjtNum skew[9], basis_skew[3][9], quat_bar[4] = {0, 0, 0, 0};
+      skew[0] = 0; skew[1] = -vector[2]; skew[2] = vector[1];
+      skew[3] = vector[2]; skew[4] = 0; skew[5] = -vector[0];
+      skew[6] = -vector[1]; skew[7] = vector[0]; skew[8] = 0;
+      for (int axis = 0; axis < 3; ++axis) {
+        mjtNum basis_vector[3] = {0, 0, 0}, es[9];
+        basis_vector[axis] = 1;
+        es[0] = 0; es[1] = -basis_vector[2]; es[2] = basis_vector[1];
+        es[3] = basis_vector[2]; es[4] = 0; es[5] = -basis_vector[0];
+        es[6] = -basis_vector[1]; es[7] = basis_vector[0]; es[8] = 0;
+        for (int row = 0; row < 3; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            mjtNum left = 0, right = 0;
+            for (int inner = 0; inner < 3; ++inner) {
+              left += es[3*row+inner]*skew[3*inner+col];
+              right += skew[3*row+inner]*es[3*inner+col];
+            }
+            basis_skew[axis][3*row+col] =
+                2*(quat[0]*es[3*row+col] + left + right);
+          }
+        }
+      }
+      for (int entry = 0; entry < 9; ++entry) {
+        quat_bar[0] += 2*root_rotation_bar[entry]*skew[entry];
+      }
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int entry = 0; entry < 9; ++entry) {
+          quat_bar[axis+1] += root_rotation_bar[entry]*basis_skew[axis][entry];
+        }
+      }
+      for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += quat_bar[k];
+      continue;
+    }
     const mjtNum* axis = d->xaxis+3*joint;
     const mjtNum* cot = bar_cdof+6*dof;
     mjtNum r[3], axis_bar[3], root_com_bar[3], tmp[3];
@@ -1539,6 +1594,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     adj_cross(root_com_bar, cot+3, axis);
     for (int k = 0; k < 3; ++k) {
       bar_pos[3*body+k] -= root_com_bar[k];
+      bar_root_com[k] += root_com_bar[k];
     }
     mjtNum quat_bar[4], axis_output_bar[3];
     adj_rotVecQuatVjp(quat_bar, axis_output_bar, d->xquat+4*body,
@@ -1546,11 +1602,28 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += quat_bar[k];
   }
 
+  if (free_root) {
+    // C = sum(m_i xip_i)/sum(m_i).  The centered offsets above contribute
+    // -sum(bar_offset_i) to the shared CoM cotangent.
+    mjtNum root_mass = m->body_subtreemass[1];
+    if (root_mass) {
+      for (int k = 0; k < 3; ++k) {
+        for (int body = 1; body < nbody; ++body) {
+          bar_root_com[k] -= bar_xipos[3*body+k];
+        }
+      }
+      for (int body = 1; body < nbody; ++body) {
+        mjtNum scale = m->body_mass[body]/root_mass;
+        for (int k = 0; k < 3; ++k) {
+          bar_xipos[3*body+k] += scale*bar_root_com[k];
+        }
+      }
+    }
+  }
+
   for (int body = 1; body < nbody; ++body) {
     for (int k = 0; k < 3; ++k) {
-      if (!(free_root && body == 1)) {
-        bar_pos[3*body+k] += bar_xipos[3*body+k];
-      }
+      bar_pos[3*body+k] += bar_xipos[3*body+k];
     }
     mjtNum ipos_quat_bar[4], unused_ipos_vec_bar[3];
     adj_rotVecQuatVjp(ipos_quat_bar, unused_ipos_vec_bar, d->xquat+4*body,
@@ -1687,7 +1760,6 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
   if (centered_fast_path && centered_free_root) {
     // The root-only derivation is for zero qvel.  Reject any nonzero root
     // velocity so the complete generic reverse remains authoritative.
-    centered_fast_path = m->nbody == 2;
     for (int dof = 0; centered_fast_path && dof < m->nv; ++dof) {
       centered_fast_path = d->qvel[dof] == 0;
     }
