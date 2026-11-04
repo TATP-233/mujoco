@@ -1210,7 +1210,7 @@ static int centered_zero_anchor_hinge_tree(const mjModel* m) {
   for (int body = 1; body < m->nbody; ++body) {
     if (m->body_rootid[body] != 1) return 0;
     if (m->body_jntnum[body] > 1) return 0;
-    if (!m->body_jntnum[body]) return 0;
+    if (!m->body_jntnum[body]) continue;
     int joint = m->body_jntadr[body];
     if (m->jnt_type[joint] != mjJNT_HINGE) return 0;
     for (int k = 0; k < 3; ++k) {
@@ -1302,7 +1302,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = 1; body < nbody; ++body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofadr[body];
+    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
     for (int k = 0; k < 6; ++k) cacc[6*body+k] = cacc[6*parent+k];
     if (dof >= 0) {
       for (int k = 0; k < 6; ++k) {
@@ -1317,22 +1317,33 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     for (int k = 0; k < 6; ++k) force[6*body+k] += inertial_acceleration[k];
   }
 
+  // The RNE dot product uses the subtree force at each joint body, while the
+  // reverse force pass below must start from each joint's direct seed.  Use the
+  // otherwise-empty bar_cvel scratch as subtree-force storage during seeding.
+  mjtNum* subtree_force = bar_cvel;
+  for (int body = 1; body < nbody; ++body) {
+    for (int k = 0; k < 6; ++k) subtree_force[6*body+k] = force[6*body+k];
+  }
+  for (int body = nbody-1; body > 0; --body) {
+    int parent = m->body_parentid[body];
+    for (int k = 0; k < 6; ++k) subtree_force[6*parent+k] += subtree_force[6*body+k];
+  }
   for (int dof = 0; dof < nv; ++dof) {
     int body = m->dof_bodyid[dof];
     mjtNum row_bar = bar_qfrc_bias[dof];
     for (int k = 0; k < 6; ++k) {
       bar_force[6*body+k] += row_bar*d->cdof[6*dof+k];
-      bar_cdof[6*dof+k] += row_bar*force[6*body+k];
+      bar_cdof[6*dof+k] += row_bar*subtree_force[6*body+k];
     }
   }
-  for (int body = nbody-1; body > 0; --body) {
+  mju_zero(bar_cvel, (size_t)6*nbody);
+  for (int body = 1; body < nbody; ++body) {
     int parent = m->body_parentid[body];
     if (!parent) continue;
     for (int k = 0; k < 6; ++k) {
       bar_force[6*body+k] += bar_force[6*parent+k];
     }
   }
-
   for (int body = 1; body < nbody; ++body) {
     const mjtNum* seed_force = bar_force+6*body;
     const mjtNum* acceleration = cacc+6*body;
@@ -1403,7 +1414,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = nbody-1; body > 0; --body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofadr[body];
+    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
     if (dof >= 0) {
       for (int k = 0; k < 6; ++k) {
         bar_cdof_dot[6*dof+k] += d->qvel[dof]*bar_cacc[6*body+k];
@@ -1416,7 +1427,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = nbody-1; body > 0; --body) {
     int parent = m->body_parentid[body];
-    int dof = m->body_dofadr[body];
+    int dof = m->body_dofnum[body] ? m->body_dofadr[body] : -1;
     for (int k = 0; k < 6; ++k) {
       bar_cvel[6*parent+k] += bar_cvel[6*body+k];
     }
@@ -1471,8 +1482,8 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     for (int k = 0; k < 3; ++k) {
       bar_pos[3*body+k] += bar_xipos[3*body+k];
     }
-    mjtNum ipos_quat_bar[4], ipos_vec_bar[3];
-    adj_rotVecQuatVjp(ipos_quat_bar, ipos_vec_bar, d->xquat+4*body,
+    mjtNum ipos_quat_bar[4], unused_ipos_vec_bar[3];
+    adj_rotVecQuatVjp(ipos_quat_bar, unused_ipos_vec_bar, d->xquat+4*body,
                       m->body_ipos+3*body, bar_xipos+3*body);
     for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += ipos_quat_bar[k];
 
@@ -1540,12 +1551,16 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
       adj_rotVecQuatVjp(bodypos_quat_bar, bodypos_vec_bar,
                         d->xquat+4*parent, m->body_pos+3*body,
                         bar_pos+3*body);
+      // The body_pos operand is a model constant.  The remaining world-position
+      // pullback to the parent is the additive identity, not the vector-output
+      // pullback of this rotation primitive.
       for (int k = 0; k < 4; ++k) {
         bar_quat[4*parent+k] += bodypos_quat_bar[k];
       }
       for (int k = 0; k < 3; ++k) {
-        bar_pos[3*parent+k] += bodypos_vec_bar[k];
+        bar_pos[3*parent+k] += bar_pos[3*body+k];
       }
+      (void) bodypos_vec_bar;
     }
   }
 
