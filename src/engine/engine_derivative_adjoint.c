@@ -4001,8 +4001,16 @@ int mjd_massPosAdjoint(const mjModel* m, mjData* d,
   for (int joint = 0; joint < m->njnt; ++joint) {
     int joint_body = m->jnt_bodyid[joint];
     int free_joint = m->jnt_type[joint] == mjJNT_FREE;
-    int channels = free_joint ? 6 : 1;
-    for (int channel = 0; channel < channels; ++channel) {
+    int channel_start = 0;
+    int channel_end = 1;
+    if (free_joint) {
+      // World-frame root translation leaves every relative pose and therefore
+      // the joint-space mass matrix unchanged.
+      mju_zero(dbar_qpos+m->jnt_dofadr[joint], 3);
+      channel_start = 3;
+      channel_end = 6;
+    }
+    for (int channel = channel_start; channel < channel_end; ++channel) {
       int dof = m->jnt_dofadr[joint]+channel;
       int rotating = m->jnt_type[joint] == mjJNT_HINGE ||
                      (free_joint && channel >= 3);
