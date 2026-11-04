@@ -48,6 +48,28 @@ mujoco_test(engine_core_util_test)
 
 mujoco_test(engine_derivative_test)
 
+mujoco_test(engine_derivative_adjoint_test)
+
+mujoco_test(engine_derivative_adjoint_ctrl_test)
+
+mujoco_test(engine_derivative_adjoint_state_test)
+
+mujoco_test(engine_derivative_adjoint_passive_test)
+
+mujoco_test(engine_derivative_adjoint_rne_test)
+
+mujoco_test(engine_derivative_adjoint_integrator_test)
+
+mujoco_test(engine_derivative_adjoint_implicit_test)
+
+mujoco_test(engine_derivative_adjoint_smooth_test)
+
+mujoco_test(engine_derivative_adjoint_mass_test)
+
+mujoco_test(engine_derivative_adjoint_step_test)
+
+mujoco_test(engine_derivative_adjoint_validation_test)
+
 mujoco_test(engine_forward_test)
 
 mujoco_test(engine_inverse_test)

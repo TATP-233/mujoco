@@ -329,7 +329,7 @@ void mjd_stepFD(const mjModel* m, mjData* d, mjtNum eps, mjtBool flg_centered,
 
   // save current inputs
   mj_getState(m, d, fullstate, restore_spec);
-  mju_copy(ctrl, d->ctrl, nu);
+  if (nu) mju_copy(ctrl, d->ctrl, nu);
   getState(m, d, state, NULL);
 
   // step input

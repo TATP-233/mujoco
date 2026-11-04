@@ -113,6 +113,7 @@ include(MujocoDependencies)
 
 set(MUJOCO_HEADERS
     include/mujoco/mjassert.h
+    include/mujoco/mjadjoint.h
     include/mujoco/mjbatch.h
     include/mujoco/mjdata.h
     include/mujoco/mjexport.h
@@ -193,9 +194,16 @@ if(MUJOCO_ENABLE_AVX_INTRINSICS)
   target_compile_definitions(mujoco PUBLIC mjUSEPLATFORMSIMD)
 endif()
 
+set(MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS "")
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN AND
+   (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  set(MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS -fno-semantic-interposition)
+endif()
+
 target_compile_options(
   mujoco
   PRIVATE ${AVX_COMPILE_OPTIONS}
+          ${MUJOCO_INTRA_LIBRARY_COMPILE_OPTIONS}
           ${MUJOCO_MACOS_COMPILE_OPTIONS}
           ${EXTRA_COMPILE_OPTIONS}
           ${MUJOCO_CXX_FLAGS}
@@ -206,6 +214,12 @@ target_link_options(
   ${MUJOCO_MACOS_LINK_OPTIONS}
   ${EXTRA_LINK_OPTIONS}
 )
+
+# MuJoCo's public entry points remain dynamically bound, but intra-library calls do not need
+# ELF interposition.  Binding them locally lets the compiler devirtualize/inlien its own helpers.
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+  target_link_options(mujoco PRIVATE "LINKER:-Bsymbolic-functions")
+endif()
 
 target_link_libraries(
   mujoco
@@ -220,8 +234,10 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(mujoco PRIVATE Threads::Threads)
 endif()
 
+set(MUJOCO_LIBRARY_NAME "mujoco" CACHE STRING "Output name of the MuJoCo shared library")
 set_target_properties(
-  mujoco PROPERTIES VERSION "${mujoco_VERSION}" PUBLIC_HEADER "${MUJOCO_HEADERS}"
+  mujoco PROPERTIES OUTPUT_NAME "${MUJOCO_LIBRARY_NAME}" VERSION "${mujoco_VERSION}"
+                    PUBLIC_HEADER "${MUJOCO_HEADERS}"
 )
 
 if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MUJOCO_ENABLE_LTO)
