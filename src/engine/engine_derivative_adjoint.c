@@ -1206,12 +1206,17 @@ static void body_inertia_mul(const mjModel* m, const mjData* d, int body,
   mju_mulMatVec3(result, rotation, local);
 }
 
-static int centered_zero_anchor_hinge_tree(const mjModel* m) {
+static int centered_zero_anchor_hinge_tree(const mjModel* m, int* free_root) {
+  *free_root = 0;
   for (int body = 1; body < m->nbody; ++body) {
     if (m->body_rootid[body] != 1) return 0;
     if (m->body_jntnum[body] > 1) return 0;
     if (!m->body_jntnum[body]) continue;
     int joint = m->body_jntadr[body];
+    if (body == 1 && m->jnt_type[joint] == mjJNT_FREE) {
+      *free_root = 1;
+      continue;
+    }
     if (m->jnt_type[joint] != mjJNT_HINGE) return 0;
     for (int k = 0; k < 3; ++k) {
       if (m->jnt_pos[3*joint+k] != 0) return 0;
@@ -1275,7 +1280,7 @@ static void mulInertVecT(const mjtNum inertia[10], const mjtNum cot[6],
 
 static int centered_zero_anchor_hinge_bias_pos_adjoint(
     const mjModel* m, mjData* d, const mjtNum* bar_qfrc_bias,
-    mjtNum* dbar_qpos) {
+    mjtNum* dbar_qpos, int free_root) {
   int nbody = m->nbody;
   int nv = m->nv;
   if (!nbody) return mjADJ_OK;
@@ -1352,6 +1357,7 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     mjtNum offset[3], inner_bar[6];
     adj_sub3(offset, d->xipos+3*body,
              d->subtree_com+3*m->body_rootid[body]);
+    if (free_root && body == 1) adj_zero3(offset);
 
     const mjtNum* seed_ang = seed_force;
     const mjtNum* seed_lin = seed_force+3;
@@ -1407,7 +1413,9 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
             (2*common_a*offset[k] - common_b*cot_ang[k] -
              common_c*motion_ang[k]);
         offset_bar += body_mass*(tmp[k] + tmp1[k]);
-        bar_xipos[3*body+k] += offset_bar;
+        if (!(free_root && body == 1)) {
+          bar_xipos[3*body+k] += offset_bar;
+        }
       }
     }
   }
@@ -1462,6 +1470,66 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     if (!m->body_jntnum[body]) continue;
     int joint = m->body_jntadr[body];
     int dof = m->jnt_dofadr[joint];
+    if (free_root && body == 1) {
+      // cdof[3+k] = [a_k; a_k x r], where a_k is column k of the root
+      // rotation and r = R * body_ipos.  Keep this cotangent with respect to
+      // R itself; the quaternion pullback below acts directly on that map.
+      mjtNum root_rotation_bar[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+      for (int k = 0; k < 3; ++k) {
+        mjtNum r[3], basis[3], basis_bar[3], r_bar[3];
+        adj_mulMatVec3(r, d->xmat+9*body, m->body_ipos+3*body);
+        basis[0] = d->xmat[9*body+k];
+        basis[1] = d->xmat[9*body+3+k];
+        basis[2] = d->xmat[9*body+6+k];
+        const mjtNum* cot = bar_cdof+6*(dof+3+k);
+        adj_cross(basis_bar, r, cot+3);
+        adj_cross(r_bar, cot+3, basis);
+        for (int i = 0; i < 3; ++i) {
+          root_rotation_bar[3*i+k] += basis_bar[i];
+          // d(R @ ipos)_ij = dR_ij * ip_j.
+          for (int j = 0; j < 3; ++j) {
+            root_rotation_bar[3*i+j] += r_bar[i]*m->body_ipos[3*body+j];
+          }
+        }
+      }
+
+      // Convert the root rotation cotangent through the exact basis-map VJP.
+      // R = I + 2*q0*[q_vec]x + 2*[q_vec]x^2.
+      const mjtNum* quat = d->xquat+4*body;
+      const mjtNum* vector = quat+1;
+      mjtNum skew[9], basis_skew[3][9], quat_bar[4] = {0, 0, 0, 0};
+      skew[0] = 0; skew[1] = -vector[2]; skew[2] = vector[1];
+      skew[3] = vector[2]; skew[4] = 0; skew[5] = -vector[0];
+      skew[6] = -vector[1]; skew[7] = vector[0]; skew[8] = 0;
+      for (int axis = 0; axis < 3; ++axis) {
+        mjtNum basis_vector[3] = {0, 0, 0}, es[9];
+        basis_vector[axis] = 1;
+        es[0] = 0; es[1] = -basis_vector[2]; es[2] = basis_vector[1];
+        es[3] = basis_vector[2]; es[4] = 0; es[5] = -basis_vector[0];
+        es[6] = -basis_vector[1]; es[7] = basis_vector[0]; es[8] = 0;
+        for (int row = 0; row < 3; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            mjtNum left = 0, right = 0;
+            for (int inner = 0; inner < 3; ++inner) {
+              left += es[3*row+inner]*skew[3*inner+col];
+              right += skew[3*row+inner]*es[3*inner+col];
+            }
+            basis_skew[axis][3*row+col] =
+                2*(quat[0]*es[3*row+col] + left + right);
+          }
+        }
+      }
+      for (int entry = 0; entry < 9; ++entry) {
+        quat_bar[0] += 2*root_rotation_bar[entry]*skew[entry];
+      }
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int entry = 0; entry < 9; ++entry) {
+          quat_bar[axis+1] += root_rotation_bar[entry]*basis_skew[axis][entry];
+        }
+      }
+      for (int k = 0; k < 4; ++k) bar_quat[4*body+k] += quat_bar[k];
+      continue;
+    }
     const mjtNum* axis = d->xaxis+3*joint;
     const mjtNum* cot = bar_cdof+6*dof;
     mjtNum r[3], axis_bar[3], root_com_bar[3], tmp[3];
@@ -1480,7 +1548,9 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
 
   for (int body = 1; body < nbody; ++body) {
     for (int k = 0; k < 3; ++k) {
-      bar_pos[3*body+k] += bar_xipos[3*body+k];
+      if (!(free_root && body == 1)) {
+        bar_pos[3*body+k] += bar_xipos[3*body+k];
+      }
     }
     mjtNum ipos_quat_bar[4], unused_ipos_vec_bar[3];
     adj_rotVecQuatVjp(ipos_quat_bar, unused_ipos_vec_bar, d->xquat+4*body,
@@ -1519,6 +1589,38 @@ static int centered_zero_anchor_hinge_bias_pos_adjoint(
     int joint = m->body_jntnum[body] ? m->body_jntadr[body] : -1;
     mjtNum relative_quat[4], hinge_quat[4], hinge_derivative[4];
     mju_mulQuat(relative_quat, d->xquat+4*parent, m->body_quat+4*body);
+    if (joint >= 0 && m->jnt_type[joint] == mjJNT_FREE) {
+      int dof = m->jnt_dofadr[joint];
+      for (int k = 0; k < 3; ++k) {
+        dbar_qpos[dof+k] += bar_pos[3*body+k];
+      }
+      // bar_quat is a cotangent of the normalized runtime quaternion.  The
+      // freejoint qpos coordinates are raw, so project through normalization
+      // before applying mj_integratePos's local-right-multiplication tangent.
+      const mjtNum* raw = d->qpos + m->jnt_qposadr[joint] + 3;
+      mjtNum normalized[4], raw_bar[4];
+      mju_copy4(normalized, raw);
+      mjtNum raw_norm = mju_normalize4(normalized);
+      mjtNum normalized_projection = mju_dot(normalized, bar_quat+4*body, 4);
+      for (int k = 0; k < 4; ++k) {
+        raw_bar[k] = (bar_quat[4*body+k] -
+                      normalized[k]*normalized_projection) / raw_norm;
+      }
+
+      // mj_integratePos applies a local right multiplication.  Build the
+      // exact infinitesimal quaternion column q * [1; e_col/2] - q.
+      for (int col = 0; col < 3; ++col) {
+        mjtNum local_quat[4] = {1, 0, 0, 0}, derivative[4];
+        local_quat[1+col] = 0.5;
+        mju_mulQuat(derivative, normalized, local_quat);
+        for (int k = 0; k < 4; ++k) derivative[k] -= normalized[k];
+        // The update first normalizes the raw input quaternion; its raw
+        // coordinate tangent therefore carries the raw norm as a scale.
+        for (int k = 0; k < 4; ++k) derivative[k] *= raw_norm;
+        dbar_qpos[dof+3+col] += mju_dot(derivative, raw_bar, 4);
+      }
+      continue;
+    }
     mjtNum split_left_bar[4], hinge_bar[4];
     if (joint >= 0) {
       int qposadr = m->jnt_qposadr[joint];
@@ -1580,9 +1682,19 @@ int mjd_rneBiasPosAdjoint(const mjModel* m, mjData* d,
     return mjADJ_INVALID_ARGUMENT;
   }
   mju_zero(dbar_qpos, m->nv);
-  if (centered_zero_anchor_hinge_tree(m)) {
+  int centered_free_root = 0;
+  int centered_fast_path = centered_zero_anchor_hinge_tree(m, &centered_free_root);
+  if (centered_fast_path && centered_free_root) {
+    // The root-only derivation is for zero qvel.  Reject any nonzero root
+    // velocity so the complete generic reverse remains authoritative.
+    centered_fast_path = m->nbody == 2;
+    for (int dof = 0; centered_fast_path && dof < m->nv; ++dof) {
+      centered_fast_path = d->qvel[dof] == 0;
+    }
+  }
+  if (centered_fast_path) {
     return centered_zero_anchor_hinge_bias_pos_adjoint(
-        m, d, bar_qfrc_bias, dbar_qpos);
+        m, d, bar_qfrc_bias, dbar_qpos, centered_free_root);
   }
   mj_markStack(d);
   mjtNum* storage = mjSTACKALLOC(d, 75*m->nbody, mjtNum);
