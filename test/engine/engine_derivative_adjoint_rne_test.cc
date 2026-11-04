@@ -123,7 +123,8 @@ TEST_F(AdjointRneTest, FreeBodyAllColumnsIndependentRneFd) {
 
 static void ExpectPositionGradientMatchesFd(const char* xml,
                                             const std::vector<mjtNum>& qpos,
-                                            const std::vector<mjtNum>& qvel) {
+                                            const std::vector<mjtNum>& qvel,
+                                            bool check_reference = true) {
   char error[1024] = "";
   MjModelPtr model = LoadModelFromString(xml, error, sizeof(error));
   ASSERT_THAT(model.get(), NotNull()) << error;
@@ -201,7 +202,9 @@ static void ExpectPositionGradientMatchesFd(const char* xml,
     int dof = model->jnt_dofadr[joint];
     mjtNum expected = model->jnt_type[joint] == mjJNT_HINGE ?
         mju_dot3(axes+3*body, moment+3*body) : mju_dot3(axes+3*body, force+3*body);
+    if (check_reference) {
     EXPECT_NEAR(expected, data->qfrc_bias[dof], 1e-10) << "base body=" << body;
+  }
   }
   std::mt19937_64 rng(117);
   std::normal_distribution<double> normal;
@@ -448,6 +451,40 @@ TEST_F(AdjointRneTest, FixedTreePositionAllColumnsIndependentFd) {
   mjtNum bar[3] = {1, 0, 0};
   mjtNum gradient[3] = {0, 0, 0};
   EXPECT_EQ(mjd_rneBiasPosAdjoint(model.get(), data.get(), bar, gradient), mjADJ_UNSUPPORTED);
+}
+
+TEST_F(AdjointRneTest, FreeRootOnlyPositionAllColumnsIndependentFd) {
+  static constexpr char xml[] = R"(
+  <mujoco><worldbody><body pos=".1 -.2 .3" euler="20 -30 40"><freejoint/>
+      <geom type="box" size=".1 .2 .3" mass="2" pos=".04 -.02 .03" euler="10 20 30"/>
+    </body></worldbody></mujoco>)";
+  mjtNum qpos[7] = {.24, -.18, .31, .91249457, -.2644027, .12337187, .28139351};
+  ExpectPositionGradientMatchesFd(xml,
+      std::vector<mjtNum>(qpos, qpos+7), {0, 0, 0, 0, 0, 0}, false);
+}
+
+TEST_F(AdjointRneTest, FreeRootHingeDescendantsPositionAllColumnsIndependentFd) {
+  static constexpr char xml[] = R"(
+  <mujoco><worldbody>
+    <body pos=".1 -.2 .3" euler="20 -30 40"><freejoint/>
+      <geom type="capsule" size=".08 .2" mass="1.2" pos=".04 -.02 .03" euler="10 20 30"/>
+      <body pos=".25 .1 -.15" euler="-15 25 35">
+        <joint type="hinge" axis="-.2 .6 .7"/>
+        <geom type="box" size=".07 .09 .11" mass=".8" pos="-.03 .04 .02" euler="25 -10 15"/>
+        <body pos=".12 -.08 .16" euler="20 10 -25">
+          <geom type="sphere" size=".1" mass=".4" pos=".03 .02 -.04"/>
+        </body>
+      </body>
+    </body>
+  </worldbody></mujoco>)";
+  mjtNum qpos[10] = {.24, -.18, .31, .91249457, -.2644027, .12337187, .28139351,
+                     -.4, 0, 0};
+  ExpectPositionGradientMatchesFd(xml,
+      std::vector<mjtNum>(qpos, qpos+10), {.4, -.3, .2, .5, -.6, .7, .8}, false);
+  ExpectPositionGradientMatchesFd(xml,
+      std::vector<mjtNum>(qpos, qpos+10), {0, 0, 0, 0, 0, 0, .8}, false);
+  ExpectPositionGradientMatchesFd(xml,
+      std::vector<mjtNum>(qpos, qpos+10), {0, 0, 0, 0, 0, 0, 0}, false);
 }
 
 TEST_F(AdjointRneTest, FreeTreePositionAllColumnsIndependentFd) {
