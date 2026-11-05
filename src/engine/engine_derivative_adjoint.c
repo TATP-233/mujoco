@@ -265,16 +265,45 @@ static int plane_sphere_cone_hessian(const mjModel* m, const mjData* d, mjtNum* 
   return mjADJ_OK;
 }
 
-static int contact_pair_status(const mjModel* m, const mjData* d, int* pair_kind) {
-  if (pair_kind) *pair_kind = 0;
-  if (!d->ncon) return mjADJ_OK;
-  if (d->ne || d->nf || d->ncon != 1) return mjADJ_UNSUPPORTED;
-  int dim = d->contact[0].dim;
-  if (!((dim == 1 && d->nefc == 1) ||
-        (dim >= 3 && m->opt.cone == mjCONE_PYRAMIDAL && d->nefc == 2*(dim-1)) ||
-        (dim >= 3 && dim <= 6 && m->opt.cone == mjCONE_ELLIPTIC && d->nefc == dim))) {
-    return mjADJ_UNSUPPORTED;
+// per-contact pair kind: 0 = plane (world-fixed) vs sphere/capsule/box/cylinder/ellipsoid,
+// 1 = capsule-capsule family (sphere/sphere, sphere/capsule), 2 = sphere/capsule vs box,
+// 3 = sphere vs cylinder; -1 = unsupported pair
+static int contact_pair_kind(const mjModel* m, const mjContact* con) {
+  int type1 = m->geom_type[con->geom1];
+  int type2 = m->geom_type[con->geom2];
+  if ((type1 == mjGEOM_CAPSULE || type1 == mjGEOM_SPHERE) &&
+      (type2 == mjGEOM_CAPSULE || type2 == mjGEOM_SPHERE)) {
+    return 1;
   }
+  if ((type1 == mjGEOM_SPHERE || type1 == mjGEOM_CAPSULE) && type2 == mjGEOM_BOX) {
+    return 2;
+  }
+  if (type1 == mjGEOM_SPHERE && type2 == mjGEOM_CYLINDER) {
+    return 3;
+  }
+  int sphere = con->geom1;
+  int plane = con->geom2;
+  if (m->geom_type[plane] != mjGEOM_PLANE) {
+    sphere = con->geom2;
+    plane = con->geom1;
+  }
+  int moving_type = m->geom_type[sphere];
+  if ((moving_type != mjGEOM_SPHERE && moving_type != mjGEOM_CAPSULE &&
+       moving_type != mjGEOM_BOX && moving_type != mjGEOM_CYLINDER &&
+       moving_type != mjGEOM_ELLIPSOID) ||
+      m->geom_type[plane] != mjGEOM_PLANE || m->geom_bodyid[plane] != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+// validate the whole contact set: every contact's constraint block must be a supported
+// cone/dim combination on a supported geom pair; all constraint rows must be in a smooth
+// state. Contacts excluded from the solver (efc_address < 0) own no rows and contribute
+// nothing, so they are skipped.
+static int contact_set_status(const mjModel* m, const mjData* d) {
+  if (!d->ncon) return mjADJ_OK;
+  if (d->ne || d->nf) return mjADJ_UNSUPPORTED;
   for (int row = 0; row < d->nefc; ++row) {
     if (d->efc_state[row] != mjCNSTRSTATE_QUADRATIC &&
         d->efc_state[row] != mjCNSTRSTATE_SATISFIED &&
@@ -282,35 +311,22 @@ static int contact_pair_status(const mjModel* m, const mjData* d, int* pair_kind
           return mjADJ_NON_SMOOTH;
     }
   }
-  int type1 = m->geom_type[d->contact[0].geom1];
-  int type2 = m->geom_type[d->contact[0].geom2];
-  if (((type1 == mjGEOM_CAPSULE || type1 == mjGEOM_SPHERE) &&
-       (type2 == mjGEOM_CAPSULE || type2 == mjGEOM_SPHERE))) {
-    if (pair_kind) *pair_kind = 1;
-    return mjADJ_OK;
+  // the cone-state Hessian path is derived for a single contact only
+  if (d->ncon > 1 && m->opt.cone == mjCONE_ELLIPTIC) {
+    for (int row = 0; row < d->nefc; ++row) {
+      if (d->efc_state[row] == mjCNSTRSTATE_CONE) return mjADJ_UNSUPPORTED;
+    }
   }
-  int t1b = m->geom_type[d->contact[0].geom1];
-  int t2b = m->geom_type[d->contact[0].geom2];
-  if ((t1b == mjGEOM_SPHERE || t1b == mjGEOM_CAPSULE) && t2b == mjGEOM_BOX) {
-    if (pair_kind) *pair_kind = 2;
-    return mjADJ_OK;
-  }
-  if (t1b == mjGEOM_SPHERE && t2b == mjGEOM_CYLINDER) {
-    if (pair_kind) *pair_kind = 3;
-    return mjADJ_OK;
-  }
-  int sphere = d->contact[0].geom1;
-  int plane = d->contact[0].geom2;
-  if (m->geom_type[plane] != mjGEOM_PLANE) {
-    sphere = d->contact[0].geom2;
-    plane = d->contact[0].geom1;
-  }
-  int moving_type = m->geom_type[sphere];
-  if ((moving_type != mjGEOM_SPHERE && moving_type != mjGEOM_CAPSULE &&
-       moving_type != mjGEOM_BOX && moving_type != mjGEOM_CYLINDER &&
-       moving_type != mjGEOM_ELLIPSOID) ||
-      m->geom_type[plane] != mjGEOM_PLANE || m->geom_bodyid[plane] != 0) {
-    return mjADJ_UNSUPPORTED;
+  for (int c = 0; c < d->ncon; ++c) {
+    const mjContact* con = d->contact + c;
+    if (con->efc_address < 0) continue;
+    int dim = con->dim;
+    if (!((dim == 1) ||
+          (dim >= 3 && m->opt.cone == mjCONE_PYRAMIDAL) ||
+          (dim >= 3 && dim <= 6 && m->opt.cone == mjCONE_ELLIPTIC))) {
+      return mjADJ_UNSUPPORTED;
+    }
+    if (contact_pair_kind(m, con) < 0) return mjADJ_UNSUPPORTED;
   }
   return mjADJ_OK;
 }
@@ -539,8 +555,7 @@ int mjd_stepAdjoint(const mjModel* m, mjData* d, mjAdjContext* ctx,
       d->nJ > ctx->capacity_nJ || d->nA > ctx->capacity_nA) {
     return mjADJ_ENGINE_ERROR;
   }
-  int pair_kind = 0;
-  status = contact_pair_status(m, d, &pair_kind);
+  status = contact_set_status(m, d);
   if (status != mjADJ_OK) {
     return status;
   }
@@ -726,18 +741,39 @@ int mjd_stepAdjoint(const mjModel* m, mjData* d, mjAdjContext* ctx,
   if (d->ncon) {
     const mjtNum* pos_bar = implicit_factor ? contact_y : y;
     const mjtNum* solver_qacc = implicit_factor ? backward.qacc : qacc_adv;
-    status = pair_kind == 3 ?
-        sphere_cylinder_pos_adjoint(m, &backward, pos_bar, contact_lambda, contact_mu,
-                                    contact_q, solver_qacc, -1, ctx->grad_qpos) :
-        pair_kind == 2 ?
-        sphere_box_face_pos_adjoint(m, &backward, pos_bar, contact_lambda, contact_mu,
-                                    contact_q, solver_qacc, -1, ctx->grad_qpos) :
-        pair_kind == 1 ?
-        mjd_capsuleCapsuleStepPosAdjoint(m, &backward, pos_bar, contact_lambda, contact_mu,
-                                         contact_q, solver_qacc, ctx->grad_qpos) :
-        mjd_planeSphereStepPosAdjoint(m, &backward, pos_bar, contact_lambda, contact_mu,
-                                      contact_q, solver_qacc, ctx->grad_qpos);
-    if (status != mjADJ_OK) return status;
+    // Per-contact accumulation: contact i's constraint rows depend geometrically only on
+    // contact i's geom pair, and every position-adjoint term is linear in that block's
+    // lambda/mu (which the full-system solve above already couples), so the total is the
+    // sum of the single-contact pair adjoints applied to per-contact views of the data.
+    for (int c = 0; c < d->ncon; ++c) {
+      const mjContact* con = d->contact + c;
+      int off = con->efc_address;
+      if (off < 0) continue;  // excluded from the solver: owns no constraint rows
+      int dim = con->dim;
+      int cnt = dim == 1 ? 1 : (m->opt.cone == mjCONE_PYRAMIDAL ? 2*(dim-1) : dim);
+      mjData view = backward;
+      view.contact = backward.contact + c;
+      view.ncon = 1;
+      view.nefc = cnt;
+      view.efc_state = backward.efc_state + off;
+      view.efc_KBIP = backward.efc_KBIP + 4*off;
+      view.efc_R = backward.efc_R + off;
+      view.efc_pos = backward.efc_pos + off;
+      view.efc_margin = backward.efc_margin + off;
+      int kind = contact_pair_kind(m, con);  // >= 0, gated by contact_set_status
+      status = kind == 3 ?
+          sphere_cylinder_pos_adjoint(m, &view, pos_bar, contact_lambda+off, contact_mu+off,
+                                      contact_q+off, solver_qacc, -1, ctx->grad_qpos) :
+          kind == 2 ?
+          sphere_box_face_pos_adjoint(m, &view, pos_bar, contact_lambda+off, contact_mu+off,
+                                      contact_q+off, solver_qacc, -1, ctx->grad_qpos) :
+          kind == 1 ?
+          mjd_capsuleCapsuleStepPosAdjoint(m, &view, pos_bar, contact_lambda+off, contact_mu+off,
+                                           contact_q+off, solver_qacc, ctx->grad_qpos) :
+          mjd_planeSphereStepPosAdjoint(m, &view, pos_bar, contact_lambda+off, contact_mu+off,
+                                        contact_q+off, solver_qacc, ctx->grad_qpos);
+      if (status != mjADJ_OK) return status;
+    }
   }
   const mjtNum* force_bar = d->ncon && implicit_factor ? contact_y : y;
   if (m->nu) {

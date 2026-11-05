@@ -2483,6 +2483,100 @@ TEST_F(AdjointStepTest, PlaneCapsuleSingleEndpointAllInputColumns) {
   EXPECT_EQ(compared, 8*18*8);
 }
 
+TEST_F(AdjointStepTest, PlaneCapsuleTwoContactsAllInputColumns) {
+  // Two capsules of one free body touch the plane simultaneously: the position-level
+  // contact adjoint must accumulate the per-contact pair contributions (each weighted by
+  // its own constraint block of the globally coupled solve) instead of rejecting ncon > 1.
+  static constexpr char xml[] = R"(
+  <mujoco><option solver="Newton" integrator="implicitfast" timestep=".002" iterations="100">
+    <flag island="disable" warmstart="disable"/></option>
+    <worldbody>
+      <geom type="plane" size="5 5 .1" condim="3" solimp=".9 .95 .001" solref=".02 1"/>
+      <body pos="0 0 .125"><freejoint/>
+        <geom type="capsule" size=".03 .1" mass=".6" pos=".15 0 0" condim="3"
+              solimp=".9 .95 .001" solref=".02 1"/>
+        <geom type="capsule" size=".03 .1" mass=".6" pos="-.15 0 0" condim="3"
+              solimp=".9 .95 .001" solref=".02 1"/>
+        <body pos=".15 0 .1">
+          <joint name="j1" type="hinge" axis="0 1 0" damping=".1"/>
+          <geom type="sphere" size=".02" mass=".2" contype="0" conaffinity="0"/>
+        </body>
+      </body>
+    </worldbody>
+    <actuator><position joint="j1" kp="1.2" kv=".1"/></actuator>
+  </mujoco>)";
+  char error[1024] = "";
+  MjModelPtr model = LoadModelFromString(xml, error, sizeof(error));
+  ASSERT_THAT(model.get(), NotNull()) << error;
+  model->opt.tolerance = 0;
+  model->opt.ls_tolerance = 0;
+  model->opt.ls_iterations = 100;
+  int compared = 0;
+  for (int integrator_case = 0; integrator_case < 2; ++integrator_case) {
+    SCOPED_TRACE(testing::Message() << "integrator=" << integrator_case);
+    model->opt.integrator = integrator_case == 0 ? mjINT_IMPLICITFAST : mjINT_EULER;
+    for (int geom = 0; geom < model->ngeom; ++geom) {
+      model->geom_solimp[mjNIMP*geom+2] = integrator_case == 0 ? .021 : .001;
+    }
+    MjDataPtr data = MakeData(model);
+    mjtNum qvel[7] = {0, 0, -2, .5, -.3, .2, .15};
+    mju_copy(data->qvel, qvel, 7);
+    data->ctrl[0] = .3;
+    mj_forward(model.get(), data.get());
+    ASSERT_EQ(data->ncon, 2);
+    ASSERT_EQ(data->nefc, 8);
+    for (int c = 0; c < data->ncon; ++c) {
+      int g1 = model->geom_type[data->contact[c].geom1];
+      int g2 = model->geom_type[data->contact[c].geom2];
+      ASSERT_TRUE((g1 == mjGEOM_PLANE && g2 == mjGEOM_CAPSULE) ||
+                  (g1 == mjGEOM_CAPSULE && g2 == mjGEOM_PLANE));
+      ASSERT_GE(data->contact[c].efc_address, 0);
+    }
+    StepContextPtr ctx(mj_makeAdjContext(model.get()));
+    ASSERT_THAT(ctx.get(), NotNull());
+    ASSERT_EQ(mj_reserveAdjContext(ctx.get(), 2, data->nefc, 256, 1024), mjADJ_OK);
+    MjDataPtr reference = MakeData(model);
+    mj_copyData(reference.get(), model.get(), data.get());
+    mj_step(model.get(), reference.get());
+    std::mt19937_64 rng(31000+integrator_case);
+    std::normal_distribution<double> normal;
+    for (int sample = 0; sample < 18; ++sample) {
+      std::vector<mjtNum> bar_qpos(7, 0), bar_qvel(7, 0);
+      if (sample < 14) {
+        if (sample < 7) bar_qpos[sample] = 1;
+        else bar_qvel[sample-7] = 1;
+      } else {
+        for (int i = 0; i < 7; ++i) {
+          bar_qpos[i] = normal(rng);
+          bar_qvel[i] = normal(rng);
+        }
+      }
+      std::vector<mjtNum> grad_qpos(7, 0), grad_qvel(7, 0), grad_ctrl(1, 0);
+      MjDataPtr step_data = MakeData(model);
+      mj_copyData(step_data.get(), model.get(), data.get());
+      ASSERT_EQ(mjd_stepAdjoint(model.get(), step_data.get(), ctx.get(), bar_qpos.data(),
+                                bar_qvel.data(), grad_qpos.data(), grad_qvel.data(),
+                                grad_ctrl.data()), mjADJ_OK);
+      for (int i = 0; i < model->nq; ++i) EXPECT_EQ(step_data->qpos[i], reference->qpos[i]);
+      for (int i = 0; i < model->nv; ++i) EXPECT_EQ(step_data->qvel[i], reference->qvel[i]);
+      for (int column = 0; column < 15; ++column) {
+        InputBlock block = column < 7 ? InputBlock::kQPos :
+                           (column < 14 ? InputBlock::kQVel : InputBlock::kCtrl);
+        int index = column < 7 ? column : (column < 14 ? column-7 : column-14);
+        double fd = StepLoss(StockStepCentralTangent(model.get(), data.get(), block, index,
+                                                    2e-7), bar_qpos, bar_qvel);
+        double actual = column < 7 ? grad_qpos[index] :
+                        (column < 14 ? grad_qvel[index] : grad_ctrl[index]);
+        EXPECT_NEAR(actual, fd, 2e-7*std::max(1.0, std::abs(fd)))
+            << "sample=" << sample << " column=" << column
+            << " actual=" << actual << " fd=" << fd;
+        ++compared;
+      }
+    }
+  }
+  EXPECT_EQ(compared, 2*18*15);
+}
+
 static std::string GetFileContents(const std::string& path) {
   std::ifstream file(path);
   EXPECT_TRUE(file.good()) << "missing test asset: " << path;
